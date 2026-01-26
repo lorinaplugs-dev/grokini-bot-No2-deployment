@@ -2,25 +2,15 @@
   "name": "grokini-hot-bot",
   "version": "1.0.0",
   "description": "Solana Trading Bot for Telegram",
-  "main": "dist/grokini-hot-bot.js",
+  "main": "index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/grokini-hot-bot.js",
-    "dev": "ts-node grokini-hot-bot.ts",
-    "dev:watch": "ts-node-dev --respawn grokini-hot-bot.ts"
+    "start": "node index.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
     "bs58": "^5.0.0",
     "mongoose": "^8.5.0",
     "node-telegram-bot-api": "^0.66.0"
-  },
-  "devDependencies": {
-    "@types/node": "^20.14.0",
-    "@types/node-telegram-bot-api": "^0.64.0",
-    "ts-node": "^10.9.2",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.5.0"
   },
   "engines": {
     "node": ">=18.0.0"
