@@ -852,7 +852,7 @@ async function showMainMenu(ctx, edit = false) {
     : '⚠️ No wallet connected';
   
   const message = `
-🚀 *Hey Chad* *Welcome to WTF Snipe X Bot* 🤖
+🚀 *Hey Chad* *Welcome to Maestro Sniper Bot* 🤖
 
 *I'm your Web3 execution engine*.
 AI-driven. Battle-tested. Locked down.
