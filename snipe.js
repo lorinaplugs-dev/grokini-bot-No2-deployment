@@ -1,5 +1,5 @@
 // ============================================
-// GROKINI TRADING BOT - Complete Implementation
+// Sol Trading Bot- New - Complete Implementation
 // Jupiter V6 Integration + Multi-Wallet Support
 // ============================================
 import { Telegraf, Markup } from 'telegraf';
