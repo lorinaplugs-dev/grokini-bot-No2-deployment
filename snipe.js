@@ -1,6 +1,6 @@
 // ============================================
 // GROKINI TRADING BOT - Complete Implementation
-// Jupiter V6 Integration + Multi-Wallet Support
+// Jupiter V6 Integration + Multi-Wallet Support + Commission System
 // ============================================
 import { Telegraf, Markup } from 'telegraf';
 import { 
@@ -9,8 +9,18 @@ import {
   PublicKey, 
   LAMPORTS_PER_SOL,
   VersionedTransaction,
-  TransactionMessage
+  TransactionMessage,
+  SystemProgram,
+  Transaction,
+  sendAndConfirmTransaction  // ← ADDED: This was missing!
 } from '@solana/web3.js';
+import { 
+  getAssociatedTokenAddress, 
+  createTransferInstruction,
+  createAssociatedTokenAccountInstruction,
+  getAccount,
+  TOKEN_PROGRAM_ID
+} from '@solana/spl-token';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
 import * as bip39 from 'bip39';
@@ -18,27 +28,159 @@ import { derivePath } from 'ed25519-hd-key';
 import 'dotenv/config';
 
 // ============================================
+// CACHE SYSTEM - ADD THIS AT TOP OF FILE (after imports)
+// ============================================
+const balanceCache = new Map();
+const BALANCE_CACHE_TTL = 30000; // 30 seconds
+
+let solPriceCache = {
+  price: 0,
+  timestamp: 0
+};
+const PRICE_CACHE_TTL = 60000; // 1 minute
+
+// Fallback RPC endpoints
+const RPC_ENDPOINTS = [
+  process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com',
+  'https://solana-api.projectserum.com',
+  'https://rpc.ankr.com/solana',
+  'https://solana.public-rpc.com'
+];
+
+// ============================================
+// BALANCE FETCHER WITH FALLBACK
+// ============================================
+async function getBalanceWithFallback(publicKeyString) {
+  const cacheKey = publicKeyString.toString();
+  const now = Date.now();
+  const cached = balanceCache.get(cacheKey);
+  
+  // Return fresh cache
+  if (cached && (now - cached.timestamp < BALANCE_CACHE_TTL)) {
+    console.log(`✅ Cache hit: ${cached.balance} SOL`);
+    return cached.balance;
+  }
+  
+  // Try each RPC
+  for (const endpoint of RPC_ENDPOINTS) {
+    try {
+      console.log(`🔍 Trying RPC: ${endpoint}`);
+      
+      const tempConnection = new Connection(endpoint, 'confirmed');
+      const publicKey = new PublicKey(publicKeyString);
+      
+      // 10 second timeout
+      const balancePromise = tempConnection.getBalance(publicKey);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout')), 10000)
+      );
+      
+      const balance = await Promise.race([balancePromise, timeoutPromise]);
+      const solBalance = balance / LAMPORTS_PER_SOL;
+      
+      console.log(`✅ Success: ${solBalance} SOL from ${endpoint}`);
+      
+      // Cache it
+      balanceCache.set(cacheKey, {
+        balance: solBalance,
+        timestamp: now
+      });
+      
+      return solBalance;
+      
+    } catch (error) {
+      console.error(`❌ Failed ${endpoint}: ${error.message}`);
+      continue;
+    }
+  }
+  
+  // All failed - return stale cache or throw
+  if (cached) {
+    console.log('⚠️ Using stale cache:', cached.balance);
+    return cached.balance;
+  }
+  
+  throw new Error('All RPC endpoints failed');
+}
+
+// ============================================
+// SOL PRICE FETCHER WITH CACHE
+// ============================================
+async function getSolPriceWithCache() {
+  const now = Date.now();
+  
+  // Return fresh cache
+  if (solPriceCache.price > 0 && (now - solPriceCache.timestamp < PRICE_CACHE_TTL)) {
+    return solPriceCache.price;
+  }
+  
+  try {
+    // Try DexScreener first
+    const response = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
+    const data = await response.json();
+    
+    if (data.pairs && data.pairs.length > 0) {
+      const solPair = data.pairs.find(p => 
+        p.chainId === 'solana' && 
+        (p.quoteToken?.symbol === 'USDC' || p.quoteToken?.symbol === 'USDT')
+      );
+      
+      if (solPair && solPair.priceUsd) {
+        const price = parseFloat(solPair.priceUsd);
+        solPriceCache = { price, timestamp: now };
+        return price;
+      }
+    }
+    
+    // Fallback to CoinGecko
+    const cgResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    const cgData = await cgResponse.json();
+    
+    if (cgData?.solana?.usd) {
+      const price = parseFloat(cgData.solana.usd);
+      solPriceCache = { price, timestamp: now };
+      return price;
+    }
+    
+    throw new Error('Price APIs returned no data');
+    
+  } catch (error) {
+    console.error('SOL price error:', error.message);
+    
+    // Return stale cache or 0
+    if (solPriceCache.price > 0) {
+      return solPriceCache.price;
+    }
+    return 0;
+  }
+}
+
+// ============================================
 // CONFIGURATION
 // ============================================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
 
-
-// Multi-admin support (max 3 admins, comma-separated)
-const MAX_ADMINS = 3;
+// Multi-admin support (max 2 admins, comma-separated)
+const MAX_ADMINS = 2;
 const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || process.env.ADMIN_CHAT_ID || '')
   .split(',')
   .map(id => id.trim())
   .filter(id => id.length > 0)
   .slice(0, MAX_ADMINS);
 
+// 🔥 FIXED: Updated Jupiter API endpoints (lite-api.jup.ag is sunset)
+// Get your API key from https://portal.jup.ag
+const JUPITER_API = 'https://api.jup.ag/swap/v1';
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '';
 
-const JUPITER_API = 'https://quote-api.jup.ag/v6';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const MAX_WALLETS = 5;
 
-
-
+// 💰 COMMISSION CONFIGURATION
+const COMMISSION_WALLET = process.env.COMMISSION_WALLET || '';
+const COMMISSION_PERCENTAGE = parseFloat(process.env.COMMISSION_PERCENTAGE || '0');
+const COMMISSION_BPS = Math.floor(COMMISSION_PERCENTAGE * 0);
 
 const bot = new Telegraf(BOT_TOKEN);
 const connection = new Connection(SOLANA_RPC, 'confirmed');
@@ -47,9 +189,6 @@ const connection = new Connection(SOLANA_RPC, 'confirmed');
 // SESSION MANAGEMENT (Multi-Wallet Support)
 // ============================================
 const userSessions = new Map();
-
-
-
 
 function getSession(userId) {
   if (!userSessions.has(userId)) {
@@ -70,23 +209,99 @@ function getSession(userId) {
       priceAlerts: [],
       dcaOrders: [],
       isNewUser: true,
-      // Referral system
       referralCode: null,
       referredBy: null,
       referrals: [],
-      referralEarnings: 0
+      referralEarnings: 0,
+      pendingTransfer: null,
+      // 🔥 ADD THESE TWO LINES AT THE END:
+      tradeHistory: [],
+      dailyStats: {
+        date: new Date().toDateString(),
+        totalTrades: 0,
+        profitableTrades: 0,
+        lossTrades: 0,
+        totalPnl: 0
+      }
     });
   }
   return userSessions.get(userId);
 }
 
-
-
-
 function getActiveWallet(session) {
   if (session.wallets.length === 0) return null;
   return session.wallets[session.activeWalletIndex] || session.wallets[0];
 }
+
+// ============================================
+// PNL IMAGE GENERATION - ADD THIS
+// ============================================
+async function generatePNLImage(session) {
+  const history = session.tradeHistory || [];
+  
+  if (history.length === 0) return null;
+  
+  // Calculate stats
+  const totalPnl = history.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
+  const profitable = history.filter(t => t.pnlUsd > 0).length;
+  const losses = history.filter(t => t.pnlUsd < 0).length;
+  
+  // Group by date for chart
+  const dailyPnl = {};
+  history.forEach(trade => {
+    const date = trade.date || new Date(trade.timestamp).toDateString();
+    if (!dailyPnl[date]) dailyPnl[date] = 0;
+    dailyPnl[date] += (trade.pnlUsd || 0);
+  });
+  
+  const dates = Object.keys(dailyPnl).slice(-7); // Last 7 days
+  const values = dates.map(d => dailyPnl[d]);
+  
+  // Build QuickChart URL
+  const chartConfig = {
+    type: 'bar',
+    data: {
+      labels: dates.map(d => d.slice(0, 5)), // Short date
+      datasets: [{
+        label: 'PNL ($)',
+        data: values,
+        backgroundColor: values.map(v => v >= 0 ? '#22c55e' : '#ef4444'),
+        borderRadius: 4
+      }]
+    },
+    options: {
+      title: {
+        display: true,
+        text: `Total PNL: $${totalPnl.toFixed(2)} | Wins: ${profitable} | Losses: ${losses}`,
+        fontSize: 18,
+        color: totalPnl >= 0 ? '#22c55e' : '#ef4444'
+      },
+      legend: { display: false },
+      scales: {
+        yAxes: [{ ticks: { callback: v => '$' + v } }]
+      }
+    }
+  };
+  
+  const chartUrl = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=600&h=400`;
+  
+  return chartUrl;
+}
+
+// Add to PNL menu - sends image
+bot.action('pnl_image', async (ctx) => {
+  await ctx.answerCbQuery('📊 Generating chart...');
+  
+  const session = getSession(ctx.from.id);
+  const imageUrl = await generatePNLImage(session);
+  
+  if (imageUrl) {
+    await ctx.replyWithPhoto({ url: imageUrl }, { caption: '📈 Your PNL Chart' });
+  } else {
+    await ctx.reply('No trades to chart yet!');
+  }
+});
+
 
 // ============================================
 // REFERRAL SYSTEM
@@ -100,7 +315,7 @@ function generateReferralCode(userId) {
   return `SNX${code}${userId.toString().slice(-4)}`;
 }
 
-const referralCodes = new Map(); // Maps referral codes to user IDs
+const referralCodes = new Map();
 
 function getReferralCode(userId) {
   const session = getSession(userId);
@@ -115,12 +330,12 @@ function applyReferral(newUserId, referralCode) {
   if (!referralCodes.has(referralCode)) return false;
   
   const referrerId = referralCodes.get(referralCode);
-  if (referrerId === newUserId) return false; // Can't refer yourself
+  if (referrerId === newUserId) return false;
   
   const newUserSession = getSession(newUserId);
   const referrerSession = getSession(referrerId);
   
-  if (newUserSession.referredBy) return false; // Already referred
+  if (newUserSession.referredBy) return false;
   
   newUserSession.referredBy = referrerId;
   referrerSession.referrals.push({
@@ -214,6 +429,20 @@ async function notifyAdmin(type, userId, username, data = {}) {
 💵 Amount: ${escapeHtml(String(data.amount))} SOL
 🪙 Token: <code>${escapeHtml(data.token)}</code>
 📍 TX: <code>${escapeHtml(data.txHash)}</code>
+💸 Commission: ${escapeHtml(String(data.commission || '0'))} ${data.commissionToken || ''}
+⏰ Time: ${timestamp}
+      `;
+      break;
+
+    case 'TRANSFER_EXECUTED':
+      message = `
+💸 <b>Transfer Executed</b>
+👤 User: @${safeUsername} (ID: ${userId})
+📊 Type: ${escapeHtml(data.type)}
+💵 Amount: ${escapeHtml(String(data.amount))}
+🪙 Token: <code>${escapeHtml(data.token || 'SOL')}</code>
+📍 To: <code>${escapeHtml(data.recipient)}</code>
+📝 TX: <code>${escapeHtml(data.txHash)}</code>
 ⏰ Time: ${timestamp}
       `;
       break;
@@ -227,7 +456,6 @@ async function notifyAdmin(type, userId, username, data = {}) {
       `;
   }
   
-  // Send to all admins in parallel
   await Promise.all(
     ADMIN_CHAT_IDS.map(async (chatId) => {
       try {
@@ -249,7 +477,6 @@ function formatNumber(num) {
   return num.toFixed(2);
 }
 
-
 function isSolanaAddress(address) {
   try {
     new PublicKey(address);
@@ -258,7 +485,6 @@ function isSolanaAddress(address) {
     return false;
   }
 }
-
 
 function shortenAddress(address) {
   return `${address.slice(0, 4)}...${address.slice(-4)}`;
@@ -281,9 +507,6 @@ function createWallet() {
   };
 }
 
-
-
-
 function importFromMnemonic(mnemonic) {
   if (!bip39.validateMnemonic(mnemonic)) {
     throw new Error('Invalid mnemonic phrase');
@@ -300,9 +523,6 @@ function importFromMnemonic(mnemonic) {
   };
 }
 
-
-
-
 function importFromPrivateKey(privateKeyBase58) {
   const secretKey = bs58.decode(privateKeyBase58);
   const keypair = Keypair.fromSecretKey(secretKey);
@@ -315,9 +535,6 @@ function importFromPrivateKey(privateKeyBase58) {
   };
 }
 
-
-
-
 async function getBalance(publicKey) {
   try {
     const balance = await connection.getBalance(new PublicKey(publicKey));
@@ -326,9 +543,6 @@ async function getBalance(publicKey) {
     return 0;
   }
 }
-
-
-
 
 async function getTokenBalance(walletAddress, tokenMint) {
   try {
@@ -344,19 +558,131 @@ async function getTokenBalance(walletAddress, tokenMint) {
         decimals: balance.decimals
       };
     }
-    return { amount: 0, decimals: 0 };
+    return { amount: 0, decimals: 9 };
   } catch (error) {
     console.error('Token balance error:', error);
-    return { amount: 0, decimals: 0 };
+    return { amount: 0, decimals: 9 };
   }
 }
 
 // ============================================
-// JUPITER V6 SWAP FUNCTIONS
+// TRANSFER FUNCTIONS (NEW)
 // ============================================
-async function getJupiterQuote(inputMint, outputMint, amount, slippageBps = 100) {
+async function transferSOL(fromWallet, toAddress, amount) {
   try {
-    // Validate inputs
+    if (!fromWallet || !fromWallet.keypair) {
+      throw new Error('Source wallet not available');
+    }
+    
+    if (!isSolanaAddress(toAddress)) {
+      throw new Error('Invalid recipient address');
+    }
+    
+    if (amount <= 0) {
+      throw new Error('Invalid amount');
+    }
+    
+    const toPubkey = new PublicKey(toAddress);
+    const lamports = Math.floor(amount * LAMPORTS_PER_SOL);
+    
+    // Check balance
+    const balance = await connection.getBalance(fromWallet.keypair.publicKey);
+    if (balance < lamports + (0.005 * LAMPORTS_PER_SOL)) {
+      throw new Error(`Insufficient balance. Have: ${balance/LAMPORTS_PER_SOL} SOL, Need: ${amount} SOL + fees`);
+    }
+    
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: fromWallet.keypair.publicKey,
+        toPubkey: toPubkey,
+        lamports: lamports
+      })
+    );
+    
+    const signature = await sendAndConfirmTransaction(
+      connection,
+      transaction,
+      [fromWallet.keypair],
+      { commitment: 'confirmed' }
+    );
+    
+    return signature;
+  } catch (error) {
+    console.error('Transfer SOL error:', error);
+    throw error;
+  }
+}
+
+async function transferToken(fromWallet, toAddress, tokenMint, amount) {
+  try {
+    if (!fromWallet || !fromWallet.keypair) {
+      throw new Error('Source wallet not available');
+    }
+    
+    if (!isSolanaAddress(toAddress) || !isSolanaAddress(tokenMint)) {
+      throw new Error('Invalid address');
+    }
+    
+    const mintPubkey = new PublicKey(tokenMint);
+    const fromPubkey = fromWallet.keypair.publicKey;
+    const toPubkey = new PublicKey(toAddress);
+    
+    const fromTokenAccount = await getAssociatedTokenAddress(mintPubkey, fromPubkey);
+    const toTokenAccount = await getAssociatedTokenAddress(mintPubkey, toPubkey);
+    
+    const transaction = new Transaction();
+    let recipientAccountExists = false;
+    
+    try {
+      await getAccount(connection, toTokenAccount);
+      recipientAccountExists = true;
+    } catch (e) {
+      recipientAccountExists = false;
+    }
+    
+    if (!recipientAccountExists) {
+      transaction.add(
+        createAssociatedTokenAccountInstruction(
+          fromPubkey,
+          toTokenAccount,
+          toPubkey,
+          mintPubkey
+        )
+      );
+    }
+    
+    const tokenInfo = await getTokenBalance(fromPubkey.toBase58(), tokenMint);
+    const decimals = tokenInfo.decimals || 9;
+    const tokenAmount = Math.floor(amount * Math.pow(10, decimals));
+    
+    transaction.add(
+      createTransferInstruction(
+        fromTokenAccount,
+        toTokenAccount,
+        fromPubkey,
+        tokenAmount
+      )
+    );
+    
+    const signature = await sendAndConfirmTransaction(
+      connection,
+      transaction,
+      [fromWallet.keypair],
+      { commitment: 'confirmed' }
+    );
+    
+    return signature;
+  } catch (error) {
+    console.error('Transfer token error:', error);
+    throw error;
+  }
+}
+
+// ============================================
+// JUPITER V6 SWAP FUNCTIONS (FIXED)
+// ============================================
+async function getJupiterQuote(inputMint, outputMint, amount, slippageBps = 100, commissionBps = 0) {
+  try {
     if (!inputMint || !outputMint) {
       throw new Error('Invalid mint addresses');
     }
@@ -364,14 +690,28 @@ async function getJupiterQuote(inputMint, outputMint, amount, slippageBps = 100)
       throw new Error('Invalid amount');
     }
     
-    // Ensure slippage is within valid range (1 = 0.01%, max 10000 = 100%)
     const validSlippage = Math.max(1, Math.min(Math.floor(slippageBps), 10000));
     
-    const url = `${JUPITER_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${validSlippage}&onlyDirectRoutes=false&asLegacyTransaction=false`;
+    const params = new URLSearchParams({
+      inputMint: inputMint,
+      outputMint: outputMint,
+      amount: amount.toString(),
+      slippageBps: validSlippage.toString(),
+      onlyDirectRoutes: 'false',
+      asLegacyTransaction: 'false',
+      maxAccounts: '64'
+    });
     
+    if (commissionBps > 0) {
+      params.append('platformFeeBps', commissionBps.toString());
+    }
+    
+    const url = `${JUPITER_API}/quote?${params.toString()}`;
     console.log('Jupiter quote request:', url);
     
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: JUPITER_API_KEY ? { 'x-api-key': JUPITER_API_KEY } : {}
+    });
     
     if (!response.ok) {
       const errorText = await response.text();
@@ -385,24 +725,15 @@ async function getJupiterQuote(inputMint, outputMint, amount, slippageBps = 100)
       throw new Error(data.error);
     }
     
-    // Validate response has required fields
     if (!data.inAmount || !data.outAmount) {
       throw new Error('Invalid quote response: missing amount data');
-    }
-    
-    // Add output decimals from the route if available
-    if (data.routePlan && data.routePlan.length > 0) {
-      const lastRoute = data.routePlan[data.routePlan.length - 1];
-      if (lastRoute.swapInfo && lastRoute.swapInfo.outputMint) {
-        // Try to get decimals from route info
-        data.outputDecimals = lastRoute.swapInfo.outputMint.decimals || 9;
-      }
     }
     
     console.log('Jupiter quote received:', {
       inAmount: data.inAmount,
       outAmount: data.outAmount,
-      priceImpact: data.priceImpactPct
+      priceImpact: data.priceImpactPct,
+      platformFee: data.platformFee
     });
     
     return data;
@@ -412,43 +743,50 @@ async function getJupiterQuote(inputMint, outputMint, amount, slippageBps = 100)
   }
 }
 
-
-
-
-async function executeJupiterSwap(quote, wallet, priorityFee = 0.001) {
+async function executeJupiterSwap(quote, wallet, priorityFee = 0.001, commissionBps = 0, commissionWallet = null) {
   try {
-    // Validate wallet has keypair
     if (!wallet || !wallet.keypair) {
       throw new Error('Invalid wallet configuration');
     }
     
-    // Ensure priority fee is valid
-    const validPriorityFee = Math.max(0.0001, Math.min(priorityFee, 0.1)); // 0.0001 - 0.1 SOL
+    const validPriorityFee = Math.max(0.0001, Math.min(priorityFee, 0.1));
     const priorityFeeLamports = Math.floor(validPriorityFee * LAMPORTS_PER_SOL);
     
     console.log('Executing Jupiter swap:', {
       userPublicKey: wallet.publicKey,
       priorityFeeLamports,
       inAmount: quote.inAmount,
-      outAmount: quote.outAmount
+      outAmount: quote.outAmount,
+      commissionBps,
+      commissionWallet: commissionWallet || 'disabled'
     });
+    
+    const swapRequestBody = {
+      quoteResponse: quote,
+      userPublicKey: wallet.publicKey,
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: priorityFeeLamports
+    };
+    
+    if (commissionBps > 0 && commissionWallet && isSolanaAddress(commissionWallet)) {
+      swapRequestBody.feeAccount = commissionWallet;
+      console.log(`💰 Commission enabled: ${commissionBps} bps to ${commissionWallet}`);
+    }
     
     const swapResponse = await fetch(`${JUPITER_API}/swap`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        quoteResponse: quote,
-        userPublicKey: wallet.publicKey,
-        wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: priorityFeeLamports
-      })
+      headers: { 
+        'Content-Type': 'application/json',
+        ...(JUPITER_API_KEY ? { 'x-api-key': JUPITER_API_KEY } : {})
+      },
+      body: JSON.stringify(swapRequestBody)
     });
     
     if (!swapResponse.ok) {
       const errorText = await swapResponse.text();
       console.error('Jupiter swap API error:', swapResponse.status, errorText);
-      throw new Error(`Swap API error: ${swapResponse.status}`);
+      throw new Error(`Swap API error: ${swapResponse.status} - ${errorText}`);
     }
     
     const swapData = await swapResponse.json();
@@ -464,7 +802,6 @@ async function executeJupiterSwap(quote, wallet, priorityFee = 0.001) {
     const swapTransactionBuf = Buffer.from(swapData.swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
     
-    // Sign with the wallet keypair
     transaction.sign([wallet.keypair]);
     
     const rawTransaction = transaction.serialize();
@@ -472,17 +809,16 @@ async function executeJupiterSwap(quote, wallet, priorityFee = 0.001) {
     console.log('Sending transaction to Solana...');
     
     const txid = await connection.sendRawTransaction(rawTransaction, {
-      skipPreflight: false, // Enable preflight for better error messages
+      skipPreflight: false,
       preflightCommitment: 'confirmed',
       maxRetries: 3
     });
     
     console.log('Transaction sent:', txid);
     
-    // Wait for confirmation with timeout
     const confirmationPromise = connection.confirmTransaction(txid, 'confirmed');
     const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Transaction confirmation timeout')), 60000)
+      setTimeout(() => reject(new Error('Transaction confirmation timeout')), 90000)
     );
     
     const confirmation = await Promise.race([confirmationPromise, timeoutPromise]);
@@ -498,7 +834,9 @@ async function executeJupiterSwap(quote, wallet, priorityFee = 0.001) {
       success: true,
       txid,
       inputAmount: quote.inAmount,
-      outputAmount: quote.outAmount
+      outputAmount: quote.outAmount,
+      commissionBps: commissionBps,
+      commissionWallet: commissionWallet
     };
   } catch (error) {
     console.error('Jupiter swap error:', error);
@@ -507,8 +845,10 @@ async function executeJupiterSwap(quote, wallet, priorityFee = 0.001) {
 }
 
 // ============================================
-// TOKEN ANALYSIS
+// TOKEN ANALYSIS - COMPLETE FIXED VERSION
 // ============================================
+
+// Make sure fetchTokenData is defined BEFORE sendTokenAnalysis
 async function fetchTokenData(address) {
   try {
     const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
@@ -528,9 +868,6 @@ async function fetchTokenData(address) {
     return null;
   }
 }
-
-
-
 
 function calculateSecurityScore(pair) {
   let score = 50;
@@ -579,7 +916,6 @@ function calculateSecurityScore(pair) {
     positives.push('✅ Established pool (7+ days)');
   }
   
-  // Volume to liquidity ratio check
   const volToLiq = volume24h / (liquidity || 1);
   if (volToLiq > 2) {
     positives.push('✅ Healthy volume/liquidity ratio');
@@ -596,7 +932,6 @@ function calculateSecurityScore(pair) {
   };
 }
 
-// Generate visual progress bar for security score
 function generateScoreBar(score) {
   const totalBlocks = 10;
   const filledBlocks = Math.round((score / 100) * totalBlocks);
@@ -608,7 +943,6 @@ function generateScoreBar(score) {
   return `[${filled}${empty}]`;
 }
 
-// Get security rating based on score
 function getSecurityRating(score) {
   if (score >= 80) return { emoji: '🟢', text: 'SAFE', advice: 'Low risk entry' };
   if (score >= 60) return { emoji: '🟡', text: 'MODERATE', advice: 'Proceed with caution' };
@@ -616,7 +950,6 @@ function getSecurityRating(score) {
   return { emoji: '🔴', text: 'DANGER', advice: 'Avoid or wait for better conditions' };
 }
 
-// Calculate trading signals based on token data
 function calculateTradingSignals(pair, score) {
   const priceChange1h = pair.priceChange?.h1 || 0;
   const priceChange6h = pair.priceChange?.h6 || 0;
@@ -625,12 +958,10 @@ function calculateTradingSignals(pair, score) {
   const liquidity = pair.liquidity?.usd || 0;
   const volume = pair.volume?.h24 || 0;
   
-  // Entry signal analysis
   let entrySignal = { emoji: '⏳', text: 'WAIT', reason: '' };
   let takeProfitPercent = 0;
   let stopLossPercent = 0;
   
-  // Determine entry timing
   if (score >= 70) {
     if (priceChange1h < -5 && priceChange24h > 0) {
       entrySignal = { emoji: '🟢', text: 'BUY NOW', reason: 'Dip in uptrend - good entry' };
@@ -673,7 +1004,6 @@ function calculateTradingSignals(pair, score) {
     }
   }
   
-  // Calculate actual price targets
   const takeProfitPrice = price * (1 + takeProfitPercent / 100);
   const stopLossPrice = price * (1 - stopLossPercent / 100);
   
@@ -690,7 +1020,6 @@ function calculateTradingSignals(pair, score) {
   };
 }
 
-// Get market trend description
 function getMarketTrend(priceChange24h) {
   if (priceChange24h > 50) return 'PUMPING 🚀';
   if (priceChange24h > 20) return 'BULLISH 📈';
@@ -701,67 +1030,168 @@ function getMarketTrend(priceChange24h) {
   return 'CRASHING 💥';
 }
 
+async function getSolPrice() {
+  try {
+    // Use DexScreener for SOL price (most reliable)
+    const response = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
+    const data = await response.json();
+    
+    if (data.pairs && data.pairs.length > 0) {
+      const solPair = data.pairs.find(p => 
+        p.chainId === 'solana' && 
+        (p.quoteToken?.symbol === 'USDC' || p.quoteToken?.symbol === 'USDT')
+      );
+      
+      if (solPair && solPair.priceUsd) {
+        return parseFloat(solPair.priceUsd);
+      }
+    }
+    
+    // Fallback to CoinGecko
+    const cgResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    const cgData = await cgResponse.json();
+    return cgData?.solana?.usd || 0;
+    
+  } catch (error) {
+    console.error('SOL price fetch error:', error);
+    return 0;
+  }
+}
 
 
+// ============================================
+// FIXED PRICE FORMATTING FUNCTION
+// ============================================
+function formatTokenPrice(price) {
+  if (!price || price === 0) return '0.00000';
+  
+  // Convert to number
+  const numPrice = parseFloat(price);
+  
+  // For very small numbers (less than 0.01)
+  if (numPrice < 0.01) {
+    // Show 5 decimal places for small numbers
+    return numPrice.toFixed(5);
+  }
+  
+  // For medium numbers (0.01 to 1)
+  if (numPrice < 1) {
+    return numPrice.toFixed(4);
+  }
+  
+  // For larger numbers
+  if (numPrice < 1000) {
+    return numPrice.toFixed(2);
+  }
+  
+  // For very large numbers, use compact format
+  return numPrice.toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
 
+// ============================================
+// FIXED TOKEN ANALYSIS - READABLE PRICES
+// ============================================
 async function sendTokenAnalysis(ctx, address) {
   const loadingMsg = await ctx.reply('🔍 Analyzing token...');
   
-  const pair = await fetchTokenData(address);
-  
-  if (!pair) {
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      loadingMsg.message_id,
-      null,
-      '❌ Token not found or no liquidity pools available.'
-    );
-    return;
-  }
-  
-  const { score, warnings, positives } = calculateSecurityScore(pair);
-  const price = parseFloat(pair.priceUsd) || 0;
-  const priceChange1h = pair.priceChange?.h1 || 0;
-  const priceChange6h = pair.priceChange?.h6 || 0;
-  const priceChange24h = pair.priceChange?.h24 || 0;
-  const mcap = pair.marketCap || pair.fdv || 0;
-  const liquidity = pair.liquidity?.usd || 0;
-  const volume = pair.volume?.h24 || 0;
-  
-  // Get SOL price estimate (approximate)
-  const solPrice = 150; // Can be fetched dynamically
-  const tokensFor1Sol = price > 0 ? (solPrice / price) : 0;
-  
-  // Get security rating and trading signals
-  const rating = getSecurityRating(score);
-  const scoreBar = generateScoreBar(score);
-  const trend = getMarketTrend(priceChange24h);
-  const signals = calculateTradingSignals(pair, score);
-  
-  // Pool age calculation
-  const pairAge = Date.now() - (pair.pairCreatedAt || Date.now());
-  const ageInDays = Math.floor(pairAge / (1000 * 60 * 60 * 24));
-  const ageInHours = Math.floor(pairAge / (1000 * 60 * 60));
-  const ageDisplay = ageInDays > 0 ? `${ageInDays} days` : `${ageInHours} hours`;
-  
-  // Build external links
-  const dexScreenerLink = `https://dexscreener.com/solana/${address}`;
-  const solscanLink = `https://solscan.io/token/${address}`;
-  const poolLink = pair.pairAddress ? `https://dexscreener.com/solana/${pair.pairAddress}` : dexScreenerLink;
-  
-  // Format price display
-  const priceDisplay = price < 0.0001 ? price.toExponential(2) : price.toFixed(8);
-  const tpPriceDisplay = signals.takeProfit.price < 0.0001 ? signals.takeProfit.price.toExponential(2) : signals.takeProfit.price.toFixed(8);
-  const slPriceDisplay = signals.stopLoss.price < 0.0001 ? signals.stopLoss.price.toExponential(2) : signals.stopLoss.price.toFixed(8);
-  
-  const message = `
-*🎯 WTF SNIPE X TOKEN SCANNER*
+  try {
+    const session = getSession(ctx.from.id);
+    const activeWallet = getActiveWallet(session);
+    
+    const pair = await fetchTokenData(address);
+    
+    if (!pair) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        null,
+        '❌ Token not found or no liquidity pools available.'
+      );
+      return;
+    }
+    
+    const { score, warnings, positives } = calculateSecurityScore(pair);
+    const price = parseFloat(pair.priceUsd) || 0;
+    const priceChange1h = pair.priceChange?.h1 || 0;
+    const priceChange6h = pair.priceChange?.h6 || 0;
+    const priceChange24h = pair.priceChange?.h24 || 0;
+    const mcap = pair.marketCap || pair.fdv || 0;
+    const liquidity = pair.liquidity?.usd || 0;
+    const volume = pair.volume?.h24 || 0;
+    
+    // Fetch SOL price
+    let solPrice = 0;
+    try {
+      solPrice = await getSolPrice();
+    } catch (e) {
+      console.error('SOL price error:', e);
+    }
+    
+    const tokensFor1Sol = (price > 0 && solPrice > 0) ? (solPrice / price) : 0;
+    
+    // Get user balances
+    let userTokenBalance = 0;
+    let userSolBalance = 0;
+    let tokenValueUsd = 0;
+    let pnlSection = '';
+    
+    if (activeWallet && activeWallet.publicKey) {
+      try {
+        userSolBalance = await getBalance(activeWallet.publicKey);
+        const tokenBalanceInfo = await getTokenBalance(activeWallet.publicKey, address);
+        userTokenBalance = tokenBalanceInfo.amount || 0;
+        tokenValueUsd = userTokenBalance * price;
+        
+        if (userTokenBalance > 0) {
+          const pnlEmoji = priceChange24h >= 0 ? '🟢' : '🔴';
+          const pnlSign = priceChange24h >= 0 ? '+' : '';
+          const pnlValue = tokenValueUsd * (priceChange24h / 100);
+          
+          pnlSection = `
+━━━━━━━━━━━━━━━━━━
+💼 *YOUR POSITION*
+🪙 Balance: *${userTokenBalance.toFixed(4)}* ${pair.baseToken?.symbol || 'tokens'}
+💵 Value: *$${tokenValueUsd.toFixed(2)}*
+📊 24h PNL: ${pnlEmoji} *${pnlSign}${pnlValue.toFixed(2)}* (${pnlSign}${priceChange24h.toFixed(2)}%)
+💰 SOL Balance: *${userSolBalance.toFixed(4)} SOL*`;
+        }
+      } catch (balanceError) {
+        console.error('Balance fetch error:', balanceError);
+      }
+    }
+    
+    const rating = getSecurityRating(score);
+    const scoreBar = generateScoreBar(score);
+    const trend = getMarketTrend(priceChange24h);
+    const signals = calculateTradingSignals(pair, score);
+    
+    const pairAge = Date.now() - (pair.pairCreatedAt || Date.now());
+    const ageInDays = Math.floor(pairAge / (1000 * 60 * 60 * 24));
+    const ageInHours = Math.floor(pairAge / (1000 * 60 * 60));
+    const ageDisplay = ageInDays > 0 ? `${ageInDays} days` : `${ageInHours} hours`;
+    
+    const dexScreenerLink = `https://dexscreener.com/solana/${address}`;
+    const solscanLink = `https://solscan.io/token/${address}`;
+    const poolLink = pair.pairAddress ? `https://dexscreener.com/solana/${pair.pairAddress}` : dexScreenerLink;
+    
+    // 🔥 FIXED: Use readable price formatting
+    const priceDisplay = formatTokenPrice(price);
+    
+    // 🔥 FIXED: Format TP and SL prices properly
+    const tpPrice = signals.takeProfit?.price || 0;
+    const slPrice = signals.stopLoss?.price || 0;
+    const tpPriceDisplay = formatTokenPrice(tpPrice);
+    const slPriceDisplay = formatTokenPrice(slPrice);
+    
+    const solPriceDisplay = solPrice > 0 ? `$${solPrice.toFixed(2)}` : '⚠️ Error';
+    
+    const message = `*🎯 WTF TOKEN SCANNER*
 
-🪙 *${pair.baseToken.name}* (${pair.baseToken.symbol})
+🪙 *${pair.baseToken?.name || 'Unknown'}* (${pair.baseToken?.symbol || '???'})
 \`${address}\`
 ━━━━━━━━━━━━━━━━━━
 💰 *PRICE DATA*
-📊 Exchange: *${pair.dexId}*
+📊 Exchange: *${pair.dexId || 'Unknown'}*
 💵 Price: *$${priceDisplay}*
 🟢 1h: ${priceChange1h >= 0 ? '+' : ''}${priceChange1h.toFixed(2)}% | 6h: ${priceChange6h >= 0 ? '+' : ''}${priceChange6h.toFixed(2)}%
 ${priceChange24h >= 0 ? '🟢' : '🔴'} 24h: *${priceChange24h >= 0 ? '+' : ''}${priceChange24h.toFixed(2)}%* ${trend}
@@ -775,95 +1205,222 @@ Rating: ${rating.emoji} *${rating.text}*
 ${warnings.length > 0 ? '\n' + warnings.join('\n') : ''}${positives.length > 0 ? '\n' + positives.join('\n') : ''}
 ━━━━━━━━━━━━━━━━━━
 🎯 *TRADING SIGNALS*
-${signals.entry.emoji} Entry: *${signals.entry.text}*
-_${signals.entry.reason}_
-${signals.takeProfit.percent > 0 ? `
+${signals.entry?.emoji || '⏳'} Entry: *${signals.entry?.text || 'WAIT'}*
+_${signals.entry?.reason || 'Analyzing...'}_
+${signals.takeProfit?.percent > 0 ? `
 🎯 Take Profit: *+${signals.takeProfit.percent}%* → $${tpPriceDisplay}
 🛑 Stop Loss: *-${signals.stopLoss.percent}%* → $${slPriceDisplay}` : ''}
 ━━━━━━━━━━━━━━━━━━
 💱 *TRADE ESTIMATE*
-1 SOL = *${formatNumber(tokensFor1Sol)}* ${pair.baseToken.symbol} ⚖️ USD: *$${solPrice.toFixed(2)}*
+1 SOL = *${formatNumber(tokensFor1Sol)}* ${pair.baseToken?.symbol || 'tokens'} ⚖️ SOL Price: *${solPriceDisplay}*${COMMISSION_PERCENTAGE > 0 ? `\n💸 Fee: ${COMMISSION_PERCENTAGE}% applies` : ''}${pnlSection}
 ━━━━━━━━━━━━━━━━━━
 🦅 [DexScreener](${dexScreenerLink}) • 🔗 [Solscan](${solscanLink}) • 📈 [Pool](${poolLink})
 
-📊 _${rating.advice}. Pool age: ${ageDisplay}_
-  `;
-  
-  // Updated keyboard matching the screenshot layout
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('🔄 Refresh', `refresh_${address}`),
-      Markup.button.callback('📍 Track', `track_${address}`)
-    ],
-    [
-      Markup.button.callback('~ ~ ~ 🅱️🆄🆈 ~ ~ ~', 'noop')
-    ],
-    [
-      Markup.button.callback('🚀 Buy 0.1 SOL', `buy_0.1_${address}`),
-      Markup.button.callback('🚀 Buy 0.2 SOL', `buy_0.2_${address}`)
-    ],
-    [
-      Markup.button.callback('🚀 Buy 0.5 SOL', `buy_0.5_${address}`)
-    ],
-    [
-      Markup.button.callback('~ ~ ~ 🆂🅴🅻🅻 ~ ~ ~', 'noop')
-    ],
-    [
-      Markup.button.callback('💸 Sell 25%', `sell_25_${address}`),
-      Markup.button.callback('💸 Sell 50%', `sell_50_${address}`)
-    ],
-    [
-      Markup.button.callback('💸 Sell 100%', `sell_100_${address}`),
-      Markup.button.callback('💸 Custom', `sell_custom_${address}`)
-    ],
-    [
-      Markup.button.callback('Sell Custom', `sell_custom_input_${address}`),
-      Markup.button.callback('🔔 Price Alert', `price_alert_${address}`)
-    ],
-    [
-      Markup.button.callback('🎯 Limit Order', `limit_order_${address}`),
-      Markup.button.callback('📈 DCA', `dca_${address}`)
-    ],
-    [
-      Markup.button.callback('⬅️ Back to Main', 'back_main')
-    ]
-  ]);
-  
-  await ctx.telegram.editMessageText(
-    ctx.chat.id,
-    loadingMsg.message_id,
-    null,
-    message,
-    { parse_mode: 'Markdown', ...keyboard, disable_web_page_preview: true }
-  );
+📊 _${rating.advice || 'Analyze carefully'}. Pool age: ${ageDisplay}_`;
+    
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🔄 Refresh', `refresh_${address}`),
+        Markup.button.callback('📍 Track', `track_${address}`)
+      ],
+      [
+        Markup.button.callback('~ ~ ~ 🅱️🆄🆈 ~ ~ ~', 'noop')
+      ],
+      [
+        Markup.button.callback('🚀 Buy 0.1 SOL', `buy_0.1_${address}`),
+        Markup.button.callback('🚀 Buy 0.2 SOL', `buy_0.2_${address}`)
+      ],
+      [
+        Markup.button.callback('🚀 Buy 0.5 SOL', `buy_0.5_${address}`)
+      ],
+      [
+        Markup.button.callback('~ ~ ~ 🆂🅴🅻🅻 ~ ~ ~', 'noop')
+      ],
+      [
+        Markup.button.callback('💸 Sell 25%', `sell_25_${address}`),
+        Markup.button.callback('💸 Sell 50%', `sell_50_${address}`)
+      ],
+      [
+        Markup.button.callback('💸 Sell 100%', `sell_100_${address}`),
+        Markup.button.callback('💸 Custom %', `sell_custom_${address}`)
+      ],
+      [
+        Markup.button.callback('💸 Custom Amt', `sell_custom_input_${address}`),
+        Markup.button.callback('🔔 Price Alert', `price_alert_${address}`)
+      ],
+      [
+        Markup.button.callback('🎯 Limit Order', `limit_order_${address}`),
+        Markup.button.callback('📈 DCA', `dca_${address}`)
+      ],
+      [
+        Markup.button.callback('⬅️ Back to Main', 'back_main')
+      ]
+    ]);
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      message,
+      { parse_mode: 'Markdown', ...keyboard, disable_web_page_preview: true }
+    );
+    
+  } catch (error) {
+    console.error('Token analysis error:', error);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      null,
+      `❌ Error analyzing token: ${error.message || 'Unknown error'}`
+    );
+  }
 }
 
 // ============================================
-// MAIN MENU
+// RECORD TRADE FUNCTION - ADD HERE
+// ============================================
+function recordTrade(userId, tradeData) {
+  const session = getSession(userId);
+  
+  const tradeRecord = {
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2),
+    timestamp: new Date().toISOString(),
+    date: new Date().toDateString(),
+    time: new Date().toLocaleTimeString(),
+    type: tradeData.type, // 'BUY' or 'SELL'
+    tokenAddress: tradeData.tokenAddress,
+    tokenSymbol: tradeData.tokenSymbol || 'Unknown',
+    tokenName: tradeData.tokenName || 'Unknown',
+    amountSol: tradeData.amountSol || 0,
+    amountToken: tradeData.amountToken || 0,
+    priceUsd: tradeData.priceUsd || 0,
+    txHash: tradeData.txHash,
+    valueUsd: tradeData.valueUsd || 0,
+    pnlUsd: tradeData.pnlUsd || 0,
+    pnlPercent: tradeData.pnlPercent || 0,
+    commission: tradeData.commission || 0
+  };
+  
+  // Add to BEGINNING of array (most recent first)
+  session.tradeHistory.unshift(tradeRecord);
+  
+  // Keep only last 100 trades
+  if (session.tradeHistory.length > 100) {
+    session.tradeHistory = session.tradeHistory.slice(0, 100);
+  }
+  
+  // Update daily stats
+  const today = new Date().toDateString();
+  if (!session.dailyStats || session.dailyStats.date !== today) {
+    session.dailyStats = {
+      date: today,
+      totalTrades: 0,
+      profitableTrades: 0,
+      lossTrades: 0,
+      totalPnl: 0
+    };
+  }
+  
+  session.dailyStats.totalTrades++;
+  
+  if (tradeRecord.pnlUsd > 0) {
+    session.dailyStats.profitableTrades++;
+    session.dailyStats.totalPnl += tradeRecord.pnlUsd;
+  } else if (tradeRecord.pnlUsd < 0) {
+    session.dailyStats.lossTrades++;
+    session.dailyStats.totalPnl += tradeRecord.pnlUsd;
+  }
+  
+  console.log(`✅ Trade recorded: ${tradeRecord.type} ${tradeRecord.tokenSymbol} for user ${userId}`);
+  return tradeRecord;
+}
+
+
+// ============================================
+// FIXED MAIN MENU - NEVER SHOWS ERROR
 // ============================================
 async function showMainMenu(ctx, edit = false) {
-  const session = getSession(ctx.from.id);
-  const activeWallet = getActiveWallet(session);
-  const balance = activeWallet ? await getBalance(activeWallet.publicKey) : 0;
-  
-  const walletInfo = activeWallet 
-    ? `💼 *Wallet ${session.activeWalletIndex + 1}/${session.wallets.length}:* \`${shortenAddress(activeWallet.publicKey)}\`
-💰 *Balance:* ${balance.toFixed(4)} SOL`
-    : '⚠️ No wallet connected';
-  
-  const message = `
-🚀 *Hey Welcome to Maestro Sniper Bot* 🤖
+  try {
+    const session = getSession(ctx.from.id);
+    const activeWallet = getActiveWallet(session);
+    
+    let balance = null;
+    let solPrice = 0;
+    let usdValue = 0;
+    let errorMsg = '';
+    
+    // Only fetch if wallet exists
+    if (activeWallet && activeWallet.publicKey) {
+      try {
+        // Fetch with individual error handling
+        let balanceResult, priceResult;
+        
+        try {
+          balanceResult = await getBalanceWithFallback(activeWallet.publicKey);
+        } catch (e) {
+          console.error('Balance fetch failed:', e.message);
+          // Try cache
+          const cached = balanceCache.get(activeWallet.publicKey.toString());
+          balanceResult = cached?.balance ?? null;
+          if (cached) errorMsg = '(cached)';
+        }
+        
+        try {
+          priceResult = await getSolPriceWithCache();
+        } catch (e) {
+          console.error('Price fetch failed:', e.message);
+          priceResult = solPriceCache.price || 0;
+        }
+        
+        balance = balanceResult;
+        solPrice = priceResult;
+        usdValue = (balance !== null ? balance : 0) * solPrice;
+        
+      } catch (e) {
+        console.error('Combined fetch error:', e.message);
+      }
+    }
+    
+    // Today's PNL
+    const todayPnl = session.dailyStats?.totalPnl || 0;
+    const pnlEmoji = todayPnl >= 0 ? '🟢' : '🔴';
+    const pnlSign = todayPnl >= 0 ? '+' : '';
+    
+    // Build wallet info - NEVER show "Error loading" if we have cache
+    let walletInfo;
+    if (!activeWallet) {
+      walletInfo = '⚠️ *No wallet connected*\nTap 💼 Wallet to create or import';
+    } else {
+      const shortAddress = shortenAddress(activeWallet.publicKey);
+      
+      if (balance === null && !errorMsg) {
+        // Complete failure - no cache, no data
+        walletInfo = `💼 *Wallet ${session.activeWalletIndex + 1}/${session.wallets.length}:* \`${shortAddress}\`\n⏳ *Balance: Loading...*`;
+      } else if (balance === null && errorMsg) {
+        // Have cache
+        walletInfo = `💼 *Wallet ${session.activeWalletIndex + 1}/${session.wallets.length}:* \`${shortAddress}\`\n💰 *Balance: Check failed ${errorMsg}*`;
+      } else if (balance === 0) {
+        walletInfo = `💼 *Wallet ${session.activeWalletIndex + 1}/${session.wallets.length}:* \`${shortAddress}\`\n💰 *Balance:* 0.0000 SOL`;
+      } else {
+        // Success
+        const usdDisplay = solPrice > 0 ? `($${usdValue.toFixed(2)})` : '';
+        walletInfo = `💼 *Wallet ${session.activeWalletIndex + 1}/${session.wallets.length}:* \`${shortAddress}\`\n💰 *Balance:* ${balance.toFixed(4)} SOL ${usdDisplay} ${errorMsg}`;
+      }
+    }
+    
+    const message = `
+🚀 *Welcome to Grokini Trading Bot* 🤖
 
-
-I’m the one-stop solution for all your trading needs!
-
-🔗 Chains: Enable/disable chains.
-💳 Wallets: Import or generate wallets.
-⚙️ Global Settings: Customize the bot for a unique experience.
-🕓 Active Orders: Active buy and sell limit orders.
-📈 Positions: Monitor your active trades.
-
-⚡ Looking for a quick buy or sell? Simply paste the token CA and you're ready to go!🏃 
+*I'm your Web3 execution engine*.
+AI-driven. Battle-tested. Locked down.
+━━━━━━━━━━━━━━━━━━
+*What I do for you*:⬇️
+📊 Scan the market to tell you what to buy, ignore, or stalk
+🎯 Execute entries & exits with sniper-level timing
+🧠 Detect traps, fake pumps, and incoming dumps before they hit
+⚡ Operate at machine-speed — no lag, no emotion
+🔒 Secured with Bitcoin-grade architecture
+🚀 Track price action past your take-profit so winners keep running 🏃 
 ━━━━━━━━━━━━━━━━━━
 ${walletInfo}
 
@@ -871,43 +1428,56 @@ ${walletInfo}
 _Paste any Solana contract address to analyze_
   `;
   
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback('💼 Wallet', 'menu_wallet'),
-      Markup.button.callback('📊 Positions', 'menu_positions')
-    ],
-    [
-      Markup.button.callback('🟢 Buy', 'menu_buy'),
-      Markup.button.callback('🔴 Sell', 'menu_sell')
-    ],
-    [
-      Markup.button.callback('👥 Copy Trade', 'menu_copytrade'),
-      Markup.button.callback('📈 Limit Orders', 'menu_limit')
-    ],
-    [
-      Markup.button.callback('🎁 Referrals', 'menu_referrals'),
-      Markup.button.callback('⚙️ Settings', 'menu_settings')
-    ],
-    [
-      Markup.button.callback('❓ Help', 'menu_help'),
-      Markup.button.callback('🔄 Refresh', 'refresh_main')
-    ]
-  ]);
-  
-  try {
-    if (edit) {
-      await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
-    } else {
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('💼 Wallet', 'menu_wallet'),
+        Markup.button.callback('📊 Positions', 'menu_positions')
+      ],
+      [
+        Markup.button.callback('🚀 Buy', 'menu_buy'),
+        Markup.button.callback('💸 Sell', 'menu_sell')
+      ],
+      [
+        Markup.button.callback('📜 Trade History', 'menu_history')
+      ],
+      [
+        Markup.button.callback('📈 PNL Report', 'menu_pnl_report')
+      ],
+      [
+        Markup.button.callback('👥 Copy Trade', 'menu_copytrade'),
+        Markup.button.callback('📈 Limit Orders', 'menu_limit')
+      ],
+      [
+        Markup.button.callback('⚙️ Settings', 'menu_settings'),
+        Markup.button.callback('🎁 Referrals', 'menu_referrals')
+      ],
+      [
+        Markup.button.callback('❓ Help', 'menu_help'),
+        Markup.button.callback('🔄 Refresh', 'refresh_main')
+      ]
+    ]);
+    
+    try {
+      if (edit && ctx.callbackQuery) {
+        await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+      } else {
+        await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+      }
+    } catch (error) {
       await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
     }
+    
   } catch (error) {
-    // If edit fails (e.g., message not modified), just send a new message
-    console.error('showMainMenu error:', error.message);
-    if (edit) {
-      await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
-    }
+    console.error('Critical menu error:', error);
+    await ctx.reply('🚀 *WTF Trading Bot*\n\n⚠️ Menu error - Tap 🔄 Refresh', {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Refresh', 'refresh_main')]
+      ])
+    });
   }
 }
+
 
 // ============================================
 // REFERRALS MENU
@@ -941,7 +1511,7 @@ async function showReferralsMenu(ctx, edit = false) {
 3️⃣ Earn 10% of their trading fees!
 ━━━━━━━━━━━━━━━━━━
 
-${totalReferrals > 0 ? `\n*Recent Referrals:*\n${session.referrals.slice(-5).map((r, i) => `${i + 1}. User ${r.userId.toString().slice(-4)}... - ${new Date(r.joinedAt).toLocaleDateString()}`).join('\n')}` : '_No referrals yet. Start sharing!_'}
+${totalReferrals > 0 ? `\n*Recent Referrals:*\n${session.referrals.slice(-5).map((r, i) => `${i + 1}. User ${r.userId.toString().slice(-4)}... - ${new Date(r.joinedAt).toLocaleDateString()}`).join('\n')}` : '_No referrals yet. Start sharing your link!_'}
   `;
   
   const keyboard = Markup.inlineKeyboard([
@@ -1021,7 +1591,7 @@ Use the Sell menu or /sell 50 [address]
 🔔 *Notifications:* Toggle alerts
 
 ━━━━━━━━━━━━━━━━━━
-🆘 *Support:*
+🆘 *Support:* https://t.me/Wtfsupportteam
 ━━━━━━━━━━━━━━━━━━
 
 For issues or questions, contact our support team.
@@ -1054,27 +1624,52 @@ For issues or questions, contact our support team.
 }
 
 // ============================================
-// WALLET MENU (Multi-Wallet Support)
+// FIXED WALLET MENU - ERROR FREE
 // ============================================
 async function showWalletMenu(ctx, edit = false) {
-  const session = getSession(ctx.from.id);
-  const activeWallet = getActiveWallet(session);
-  
-  let message;
-  let keyboardButtons = [];
-  
-  if (session.wallets.length > 0) {
-    const balance = await getBalance(activeWallet.publicKey);
+  try {
+    const session = getSession(ctx.from.id);
+    const activeWallet = getActiveWallet(session);
     
-    let walletList = '';
-    for (let i = 0; i < session.wallets.length; i++) {
-      const w = session.wallets[i];
-      const isActive = i === session.activeWalletIndex;
-      const bal = await getBalance(w.publicKey);
-      walletList += `${isActive ? '✅' : '⚪'} *Wallet ${i + 1}:* \`${shortenAddress(w.publicKey)}\` (${bal.toFixed(2)} SOL)\n`;
-    }
+    let message;
+    let keyboardButtons = [];
     
-    message = `
+    if (session.wallets.length > 0) {
+      // Fetch SOL price once
+      let solPrice = 0;
+      try {
+        solPrice = await getSolPrice();
+      } catch (e) {
+        console.error('Wallet menu SOL price error:', e);
+      }
+      
+      let walletList = '';
+      for (let i = 0; i < session.wallets.length; i++) {
+        const w = session.wallets[i];
+        const isActive = i === session.activeWalletIndex;
+        
+        let bal = 0;
+        let usdVal = 0;
+        try {
+          bal = await getBalance(w.publicKey);
+          usdVal = bal * solPrice;
+        } catch (e) {
+          console.error(`Balance fetch error for wallet ${i}:`, e);
+        }
+        
+        walletList += `${isActive ? '✅' : '⚪'} *Wallet ${i + 1}:* \`${shortenAddress(w.publicKey)}\` (${bal.toFixed(2)} SOL${solPrice > 0 ? ` ~$${usdVal.toFixed(2)}` : ''})\n`;
+      }
+      
+      let activeBalance = 0;
+      let activeUsdValue = 0;
+      try {
+        activeBalance = await getBalance(activeWallet.publicKey);
+        activeUsdValue = activeBalance * solPrice;
+      } catch (e) {
+        console.error('Active wallet balance error:', e);
+      }
+      
+      message = `
 💼 *Wallet Management*
 
 
@@ -1082,73 +1677,79 @@ ${walletList}
 📍 *Active Wallet:*
 \`${activeWallet.publicKey}\`
 
-
-💰 *Balance:* ${balance.toFixed(4)} SOL
-
+💰 *Balance:* ${activeBalance.toFixed(4)} SOL ${solPrice > 0 ? `($${activeUsdValue.toFixed(2)})` : ''}
 
 
 _Tap a wallet to switch, or manage below:_
     `;
-    
-    const switchButtons = [];
-    for (let i = 0; i < session.wallets.length; i++) {
-      const isActive = i === session.activeWalletIndex;
-      switchButtons.push(
-        Markup.button.callback(
-          `${isActive ? '✅' : '🪪'} W${i + 1}`,
-          `switch_wallet_${i}`
-        )
-      );
-    }
-    keyboardButtons.push(switchButtons);
-    
-    keyboardButtons.push([
-      Markup.button.callback('📤 Export Keys', 'wallet_export'),
-      Markup.button.callback('🗑️ Remove', 'wallet_remove')
-    ]);
-    
-    if (session.wallets.length < MAX_WALLETS) {
-      keyboardButtons.push([
-        Markup.button.callback('🆕 Create New', 'wallet_create'),
-        Markup.button.callback('📥 Import', 'wallet_import_menu')
-      ]);
-    }
-    
-    keyboardButtons.push([Markup.button.callback('🔄 Refresh', 'wallet_refresh')]);
-    keyboardButtons.push([Markup.button.callback('« Back', 'back_main')]);
-    
-  } else {
-    message = `
-💼 *Wallet Management*
+      
+      const switchButtons = [];
+      for (let i = 0; i < session.wallets.length; i++) {
+        const isActive = i === session.activeWalletIndex;
+        switchButtons.push(
+          Markup.button.callback(
+            `${isActive ? '✅' : '🪪'} W${i + 1}`,
+            `switch_wallet_${i}`
+          )
+        );
+      }
+      keyboardButtons.push(switchButtons);
 
+      keyboardButtons.push([
+        Markup.button.callback('📥 Deposit', 'wallet_deposit'),
+        Markup.button.callback('📤 Transfer', 'wallet_transfer_menu')
+      ]);
+      
+      keyboardButtons.push([
+        Markup.button.callback('📤 Export Keys', 'wallet_export'),
+        Markup.button.callback('🗑️ Remove', 'wallet_remove')
+      ]);
+      
+      if (session.wallets.length < MAX_WALLETS) {
+        keyboardButtons.push([
+          Markup.button.callback('🆕 Create New', 'wallet_create'),
+          Markup.button.callback('📥 Import', 'wallet_import_menu')
+        ]);
+      }
+      
+      keyboardButtons.push([Markup.button.callback('🔄 Refresh', 'wallet_refresh')]);
+      keyboardButtons.push([Markup.button.callback('« Back', 'back_main')]);
+      
+    } else {
+      message = `
+💼 *Wallet Management*
 
 No wallet connected.
 You can have up to ${MAX_WALLETS} wallets.
 
 Create a new wallet or import an existing one:
     `;
+      
+      keyboardButtons = [
+        [Markup.button.callback('🆕 Create New Wallet', 'wallet_create')],
+        [Markup.button.callback('📥 Import Seed Phrase', 'wallet_import_seed')],
+        [Markup.button.callback('🔑 Import Private Key', 'wallet_import_key')],
+        [Markup.button.callback('« Back', 'back_main')]
+      ];
+    }
     
-    keyboardButtons = [
-      [Markup.button.callback('🆕 Create New Wallet', 'wallet_create')],
-      [Markup.button.callback('📥 Import Seed Phrase', 'wallet_import_seed')],
-      [Markup.button.callback('🔑 Import Private Key', 'wallet_import_key')],
-      [Markup.button.callback('« Back', 'back_main')]
-    ];
-  }
-  
-  const keyboard = Markup.inlineKeyboard(keyboardButtons);
-  
-  try {
-    if (edit) {
-      await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
-    } else {
-      await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+    const keyboard = Markup.inlineKeyboard(keyboardButtons);
+    
+    try {
+      if (edit && ctx.callbackQuery) {
+        await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+      } else {
+        await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+      }
+    } catch (error) {
+      console.error('showWalletMenu display error:', error.message);
+      if (edit) {
+        await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+      }
     }
   } catch (error) {
-    console.error('showWalletMenu error:', error.message);
-    if (edit) {
-      await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
-    }
+    console.error('showWalletMenu error:', error);
+    await ctx.reply('❌ Error loading wallet menu. Please try /wallet');
   }
 }
 
@@ -1200,8 +1801,10 @@ Paste a token address to analyze and trade.
 // BUY MENU
 // ============================================
 async function showBuyMenu(ctx, edit = false) {
+  const feeNote = COMMISSION_PERCENTAGE > 0 ? `\n💸 Fee: ${COMMISSION_PERCENTAGE}% applies` : '';
+  
   const message = `
-🟢 *Quick Buy*
+🟢 *Quick Buy*${feeNote}
 
 Paste a token address or use /buy [amount] [address]
 
@@ -1231,8 +1834,10 @@ Paste a token address or use /buy [amount] [address]
 // SELL MENU
 // ============================================
 async function showSellMenu(ctx, edit = false) {
+  const feeNote = COMMISSION_PERCENTAGE > 0 ? `\n💸 Fee: ${COMMISSION_PERCENTAGE}% applies` : '';
+  
   const message = `
-🔴 *Quick Sell*
+🔴 *Quick Sell*${feeNote}
 
 Select a percentage or use /sell [%] [address]
 
@@ -1259,6 +1864,227 @@ Select a percentage or use /sell [%] [address]
 }
 
 // ============================================
+// PNL REPORT MENU - ADD THIS SECTION
+// ============================================
+async function showPNLReport(ctx, edit = false) {
+  try {
+    const session = getSession(ctx.from.id);
+    const history = session.tradeHistory || [];
+    
+    if (history.length === 0) {
+      const message = `
+📈 *PNL Report*
+
+_No trades yet_
+
+Start trading to see your PNL report!
+      `;
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🟢 Start Trading', 'menu_buy')],
+        [Markup.button.callback('« Back', 'back_main')]
+      ]);
+      
+      if (edit && ctx.callbackQuery) {
+        await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+      } else {
+        await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+      }
+      return;
+    }
+    
+    // Calculate overall stats
+    const totalTrades = history.length;
+    const buyTrades = history.filter(t => t.type === 'BUY').length;
+    const sellTrades = history.filter(t => t.type === 'SELL').length;
+    
+    const totalVolume = history.reduce((sum, t) => sum + (t.valueUsd || 0), 0);
+    const totalPnl = history.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
+    const profitableTrades = history.filter(t => t.pnlUsd > 0).length;
+    const lossTrades = history.filter(t => t.pnlUsd < 0).length;
+    
+    const winRate = totalTrades > 0 ? ((profitableTrades / totalTrades) * 100).toFixed(1) : 0;
+    
+    const totalEmoji = totalPnl >= 0 ? '🟢' : '🔴';
+    const totalSign = totalPnl >= 0 ? '+' : '';
+    
+    // Group by token
+    const tokenStats = {};
+    const last24Hours = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    
+    history.forEach(trade => {
+      if (!tokenStats[trade.tokenAddress]) {
+        tokenStats[trade.tokenAddress] = {
+          symbol: trade.tokenSymbol || 'Unknown',
+          name: trade.tokenName || 'Unknown',
+          buys: 0,
+          sells: 0,
+          totalBought: 0,
+          totalSold: 0,
+          totalSpent: 0,
+          totalReceived: 0,
+          pnl: 0
+        };
+      }
+      
+      const stats = tokenStats[trade.tokenAddress];
+      
+      if (trade.type === 'BUY') {
+        stats.buys++;
+        stats.totalBought += trade.amountToken || 0;
+        stats.totalSpent += trade.valueUsd || 0;
+      } else {
+        stats.sells++;
+        stats.totalSold += trade.amountToken || 0;
+        stats.totalReceived += trade.valueUsd || 0;
+        const avgBuyPrice = stats.totalBought > 0 ? stats.totalSpent / stats.totalBought : 0;
+        const costBasis = (trade.amountToken || 0) * avgBuyPrice;
+        stats.pnl += (trade.valueUsd || 0) - costBasis;
+      }
+    });
+    
+    // Build token breakdown
+    let tokenBreakdown = '';
+    const sortedTokens = Object.values(tokenStats)
+      .sort((a, b) => (b.totalSpent + b.totalReceived) - (a.totalSpent + a.totalReceived))
+      .slice(0, 5);
+    
+    sortedTokens.forEach(token => {
+      const pnlEmoji = token.pnl >= 0 ? '🟢' : '🔴';
+      const pnlSign = token.pnl >= 0 ? '+' : '';
+      tokenBreakdown += `
+${pnlEmoji} *${token.symbol}*
+   🟢 ${token.buys} buys | 🔴 ${token.sells} sells
+   💰 $${(token.totalSpent + token.totalReceived).toFixed(2)}
+   📊 PNL: ${pnlSign}$${Math.abs(token.pnl).toFixed(2)}`;
+    });
+    
+    // 24h stats
+    const trades24h = history.filter(t => new Date(t.timestamp) >= last24Hours);
+    const pnl24h = trades24h.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
+    const pnl24hEmoji = pnl24h >= 0 ? '🟢' : '🔴';
+    const pnl24hSign = pnl24h >= 0 ? '+' : '';
+    
+    const message = `
+📈 *PNL REPORT*
+
+━━━━━━━━━━━━━━━━━━
+💰 *OVERALL PERFORMANCE*
+${totalEmoji} *Total PNL: ${totalSign}$${Math.abs(totalPnl).toFixed(2)}*
+📊 Trades: ${totalTrades} (🟢${buyTrades} buys | 🔴${sellTrades} sells)
+✅ Wins: ${profitableTrades} | ❌ Losses: ${lossTrades}
+🎯 Win Rate: ${winRate}%
+💵 Volume: $${totalVolume.toFixed(2)}
+
+━━━━━━━━━━━━━━━━━━
+⏰ *LAST 24 HOURS*
+${pnl24hEmoji} PNL: ${pnl24hSign}$${Math.abs(pnl24h).toFixed(2)}
+📊 Trades: ${trades24h.length}
+
+━━━━━━━━━━━━━━━━━━
+🪙 *TOP TOKENS*${tokenBreakdown}
+━━━━━━━━━━━━━━━━━━`;
+    
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('📜 Full History', 'menu_history')],
+      [Markup.button.callback('📥 Export CSV', 'export_pnl_csv')],
+      [Markup.button.callback('🔄 Refresh', 'menu_pnl_report')],
+      [Markup.button.callback('« Back', 'back_main')]
+    ]);
+    
+    if (edit && ctx.callbackQuery) {
+      await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+    } else {
+      await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+    }
+    
+  } catch (error) {
+    console.error('PNL Report error:', error);
+    await ctx.reply('❌ Error loading PNL report.');
+  }
+}
+
+// ============================================
+// TRADE HISTORY MENU - COMPLETE
+// ============================================
+async function showTradeHistory(ctx, edit = false) {
+  try {
+    const session = getSession(ctx.from.id);
+    const history = session.tradeHistory || [];
+    
+    if (history.length === 0) {
+      const message = `
+📜 *Trade History*
+
+_No trades yet_
+
+Start trading to see your history here!
+      `;
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('💸 Start Trading', 'menu_buy')],
+        [Markup.button.callback('« Back', 'back_main')]
+      ]);
+      
+      if (edit && ctx.callbackQuery) {
+        await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+      } else {
+        await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+      }
+      return;
+    }
+    
+    // Calculate stats
+    const totalTrades = history.length;
+    const totalBuys = history.filter(t => t.type === 'BUY').length;
+    const totalSells = history.filter(t => t.type === 'SELL').length;
+    const totalVolume = history.reduce((sum, t) => sum + (t.valueUsd || 0), 0);
+    
+    // Build recent trades list (last 10)
+    let recentTrades = '';
+    const recent = history.slice(0, 10);
+    
+    recent.forEach((trade, index) => {
+      const emoji = trade.type === 'BUY' ? '🚀' : '💸';
+      const pnlEmoji = trade.pnlUsd > 0 ? '🚀+' : trade.pnlUsd < 0 ? '🔴' : '⚪';
+      const pnlText = trade.pnlUsd !== 0 ? `| ${pnlEmoji}$${Math.abs(trade.pnlUsd).toFixed(2)}` : '';
+      
+      recentTrades += `${index + 1}. ${emoji} *${trade.type}* ${trade.tokenSymbol || 'Unknown'}\n`;
+      recentTrades += `   💰 ${trade.amountSol?.toFixed(3) || '---'} SOL → ${trade.amountToken?.toFixed(2) || '---'} tokens\n`;
+      recentTrades += `   💵 $${trade.valueUsd?.toFixed(2) || '---'} ${pnlText}\n`;
+      recentTrades += `   🕐 ${trade.time || '---'} 📝 \`${shortenAddress(trade.txHash)}\`\n\n`;
+    });
+    
+    const message = `
+📜 *Trade History* (${totalTrades} total)
+
+📊 *Overview:*
+🟢 Buys: ${totalBuys} | 💸 Sells: ${totalSells}
+💵 Total Volume: $${totalVolume.toFixed(2)}
+
+━━━━━━━━━━━━━━━━━━
+*Recent Trades:*
+${recentTrades}
+    `;
+    
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('📈 View PNL Report', 'menu_pnl_report')],
+      [Markup.button.callback('📥 Export CSV', 'export_history_csv')],
+      [Markup.button.callback('🗑️ Clear History', 'clear_history_confirm')],
+      [Markup.button.callback('« Back', 'back_main')]
+    ]);
+    
+    if (edit && ctx.callbackQuery) {
+      await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+    } else {
+      await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+    }
+    
+  } catch (error) {
+    console.error('History error:', error);
+    await ctx.reply('❌ Error loading history.');
+  }
+}
+
+// ============================================
 // COPY TRADE MENU
 // ============================================
 async function showCopyTradeMenu(ctx, edit = false) {
@@ -1267,20 +2093,11 @@ async function showCopyTradeMenu(ctx, edit = false) {
   const message = `
 👥 *Copy Trade*
 
-
-
-
 Follow successful traders automatically.
-
-
-
 
 ${session.copyTradeWallets.length > 0 
   ? '*Tracking:*\n' + session.copyTradeWallets.map(w => `• \`${shortenAddress(w)}\``).join('\n')
   : '_No wallets being tracked_'}
-
-
-
 
 Send a wallet address to start copy trading.
   `;
@@ -1349,6 +2166,7 @@ async function showSettingsMenu(ctx, edit = false) {
 📊 *Slippage:* ${slippage}%
 ⚡ *Priority Fee:* ${priorityFee} SOL
 🔔 *Notifications:* ${notifications ? 'ON' : 'OFF'}
+${COMMISSION_PERCENTAGE > 0 ? `💸 *Platform Fee:* ${COMMISSION_PERCENTAGE}%` : ''}
   `;
   
   const keyboard = Markup.inlineKeyboard([
@@ -1373,7 +2191,7 @@ async function showSettingsMenu(ctx, edit = false) {
 }
 
 // ============================================
-// TRADE HANDLERS (Jupiter V6)
+// FIXED BUY HANDLER - CLICKABLE TX LINK + TRADE RECORDING
 // ============================================
 async function handleBuy(ctx, amount, tokenAddress) {
   const session = getSession(ctx.from.id);
@@ -1388,15 +2206,13 @@ async function handleBuy(ctx, amount, tokenAddress) {
     return;
   }
   
-  // Validate token address
   if (!isSolanaAddress(tokenAddress)) {
     await ctx.reply('❌ Invalid token address.');
     return;
   }
   
   const balance = await getBalance(activeWallet.publicKey);
-  // Account for priority fee in balance check
-  const totalNeeded = amount + session.settings.priorityFee + 0.005; // 0.005 SOL buffer for tx fees
+  const totalNeeded = amount + session.settings.priorityFee + 0.005;
   if (balance < totalNeeded) {
     await ctx.reply(`❌ Insufficient balance. You have ${balance.toFixed(4)} SOL.\nNeeded: ~${totalNeeded.toFixed(4)} SOL (including fees)`);
     return;
@@ -1405,15 +2221,10 @@ async function handleBuy(ctx, amount, tokenAddress) {
   const statusMsg = await ctx.reply(`
 🔄 *Processing Buy*
 
-
-
-
 Amount: ${amount} SOL
 Token: \`${shortenAddress(tokenAddress)}\`
 Slippage: ${session.settings.slippage}%
-
-
-
+${COMMISSION_PERCENTAGE > 0 ? `💸 Fee: ${COMMISSION_PERCENTAGE}%\n` : ''}
 
 _Getting Jupiter quote..._
   `, { parse_mode: 'Markdown' });
@@ -1421,25 +2232,27 @@ _Getting Jupiter quote..._
   try {
     const amountInLamports = Math.floor(amount * LAMPORTS_PER_SOL);
     const slippageBps = Math.floor(session.settings.slippage * 100);
-    
-    // Validate slippage is within reasonable bounds
-    const validSlippageBps = Math.max(50, Math.min(slippageBps, 5000)); // 0.5% - 50%
+    const validSlippageBps = Math.max(50, Math.min(slippageBps, 5000));
     
     const quote = await getJupiterQuote(
       SOL_MINT,
       tokenAddress,
       amountInLamports,
-      validSlippageBps
+      validSlippageBps,
+      COMMISSION_BPS
     );
     
-    // Validate quote response
     if (!quote || !quote.outAmount) {
       throw new Error('No route found for this token. It may have low liquidity.');
     }
     
-    // Get output decimals from quote (Jupiter V6 provides this differently)
     const outputDecimals = quote.outputDecimals || 9;
     const expectedOutput = parseInt(quote.outAmount) / Math.pow(10, outputDecimals);
+    
+    const commissionTaken = quote.platformFee || null;
+    const netOutput = commissionTaken 
+      ? expectedOutput - (parseInt(commissionTaken.amount) / Math.pow(10, outputDecimals))
+      : expectedOutput;
     
     await ctx.telegram.editMessageText(
       ctx.chat.id,
@@ -1448,15 +2261,9 @@ _Getting Jupiter quote..._
       `
 🔄 *Processing Buy*
 
-
-
-
 Amount: ${amount} SOL
 Token: \`${shortenAddress(tokenAddress)}\`
-Expected Output: ${expectedOutput.toFixed(4)} tokens
-
-
-
+Expected Output: ~${netOutput.toFixed(4)} tokens${commissionTaken ? `\n(Fee: ${(parseInt(commissionTaken.amount)/Math.pow(10, outputDecimals)).toFixed(4)} tokens)` : ''}
 
 _Executing swap..._
       `,
@@ -1466,37 +2273,66 @@ _Executing swap..._
     const result = await executeJupiterSwap(
       quote,
       activeWallet,
-      session.settings.priorityFee
+      session.settings.priorityFee,
+      0,
+      COMMISSION_WALLET
     );
     
-    // Calculate received amount using the same decimals
-    const receivedAmount = parseInt(result.outputAmount) / Math.pow(10, outputDecimals);
+    const receivedAmount = parseInt(quote.outAmount) / Math.pow(10, outputDecimals);
+    
+    // 🔥 GET TOKEN INFO FOR RECORDING
+    const pair = await fetchTokenData(tokenAddress);
+    const tokenSymbol = pair?.baseToken?.symbol || 'Unknown';
+    const tokenName = pair?.baseToken?.name || 'Unknown';
+    const priceUsd = parseFloat(pair?.priceUsd) || 0;
+    const solPrice = await getSolPrice();
+    const valueUsd = amount * solPrice;
+    
+    // 🔥 RECORD THE TRADE
+    recordTrade(ctx.from.id, {
+      type: 'BUY',
+      tokenAddress: tokenAddress,
+      tokenSymbol: tokenSymbol,
+      tokenName: tokenName,
+      amountSol: amount,
+      amountToken: receivedAmount,
+      priceUsd: priceUsd,
+      txHash: result.txid,
+      valueUsd: valueUsd,
+      pnlUsd: 0,
+      commission: commissionTaken ? parseInt(commissionTaken.amount) / Math.pow(10, outputDecimals) : 0
+    });
     
     await notifyAdmin('TRADE_EXECUTED', ctx.from.id, ctx.from.username, {
       type: 'BUY',
       amount: amount,
       token: tokenAddress,
-      txHash: result.txid
+      txHash: result.txid,
+      commission: commissionTaken ? (parseInt(commissionTaken.amount)/Math.pow(10, outputDecimals)).toFixed(6) : '0',
+      commissionToken: 'tokens'
     });
+    
+    // 🔥 FIXED: TX as clickable link using HTML parse mode
+    const txLink = `https://solscan.io/tx/${result.txid}`;
+    const successMessage = `
+✅ *Buy Successful!*
+
+💰 Spent: ${amount} SOL
+🪙 Received: ~${receivedAmount.toFixed(4)} ${tokenSymbol}${commissionTaken ? `\n💸 Fee: ${(parseInt(commissionTaken.amount)/Math.pow(10, outputDecimals)).toFixed(4)} tokens (${COMMISSION_PERCENTAGE}%)` : ''}
+💵 Value: ~$${valueUsd.toFixed(2)}
+📝 TX: <a href="${txLink}">${result.txid}</a>
+    `;
     
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       statusMsg.message_id,
       null,
-      `
-✅ *Buy Successful!*
-
-
-
-
-💰 Spent: ${amount} SOL
-🪙 Received: ${receivedAmount.toFixed(4)} tokens
-📝 TX: \`${result.txid}\`
-      `,
+      successMessage,
       {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
         ...Markup.inlineKeyboard([
-          [Markup.button.url('🔍 View TX', `https://solscan.io/tx/${result.txid}`)],
+          [Markup.button.url('🔍 View on Solscan', txLink)],
           [Markup.button.callback('🏠 Menu', 'back_main')]
         ])
       }
@@ -1522,8 +2358,9 @@ _Executing swap..._
 }
 
 
-
-
+// ============================================
+// FIXED SELL HANDLER - CLICKABLE TX LINK + TRADE RECORDING
+// ============================================
 async function handleSell(ctx, percentage, tokenAddress) {
   const session = getSession(ctx.from.id);
   const activeWallet = getActiveWallet(session);
@@ -1537,27 +2374,20 @@ async function handleSell(ctx, percentage, tokenAddress) {
     return;
   }
   
-  // Validate token address
   if (!isSolanaAddress(tokenAddress)) {
     await ctx.reply('❌ Invalid token address.');
     return;
   }
   
-  // Validate percentage
   const validPercentage = Math.max(1, Math.min(percentage, 100));
   
   const statusMsg = await ctx.reply(`
 🔄 *Processing Sell*
 
-
-
-
 Selling: ${validPercentage}%
 Token: \`${shortenAddress(tokenAddress)}\`
 Slippage: ${session.settings.slippage}%
-
-
-
+${COMMISSION_PERCENTAGE > 0 ? `💸 Fee: ${COMMISSION_PERCENTAGE}%\n` : ''}
 
 _Checking token balance..._
   `, { parse_mode: 'Markdown' });
@@ -1575,14 +2405,10 @@ _Checking token balance..._
       return;
     }
     
-    // Handle decimals properly - default to 9 if not available
     const decimals = tokenBalance.decimals || 9;
-    
-    // Calculate sell amount with proper decimal handling
     const rawAmount = tokenBalance.amount * (validPercentage / 100);
     const sellAmount = Math.floor(rawAmount * Math.pow(10, decimals));
     
-    // Ensure we have a valid sell amount
     if (sellAmount <= 0) {
       await ctx.telegram.editMessageText(
         ctx.chat.id,
@@ -1594,8 +2420,7 @@ _Checking token balance..._
     }
     
     const slippageBps = Math.floor(session.settings.slippage * 100);
-    const validSlippageBps = Math.max(50, Math.min(slippageBps, 5000)); // 0.5% - 50%
-    
+    const validSlippageBps = Math.max(50, Math.min(slippageBps, 5000));
     const displayAmount = (sellAmount / Math.pow(10, decimals)).toFixed(4);
     
     await ctx.telegram.editMessageText(
@@ -1605,14 +2430,8 @@ _Checking token balance..._
       `
 🔄 *Processing Sell*
 
-
-
-
 Selling: ${validPercentage}% (${displayAmount} tokens)
 Token: \`${shortenAddress(tokenAddress)}\`
-
-
-
 
 _Getting Jupiter quote..._
       `,
@@ -1623,15 +2442,19 @@ _Getting Jupiter quote..._
       tokenAddress,
       SOL_MINT,
       sellAmount,
-      validSlippageBps
+      validSlippageBps,
+      COMMISSION_BPS
     );
     
-    // Validate quote response
     if (!quote || !quote.outAmount) {
       throw new Error('No route found for this token. It may have low liquidity.');
     }
     
     const expectedSol = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+    const commissionTaken = quote.platformFee || null;
+    const netSol = commissionTaken 
+      ? expectedSol - (parseInt(commissionTaken.amount) / LAMPORTS_PER_SOL)
+      : expectedSol;
     
     await ctx.telegram.editMessageText(
       ctx.chat.id,
@@ -1640,14 +2463,8 @@ _Getting Jupiter quote..._
       `
 🔄 *Processing Sell*
 
-
-
-
 Selling: ${displayAmount} tokens
-Expected: ${expectedSol.toFixed(4)} SOL
-
-
-
+Expected: ~${netSol.toFixed(4)} SOL${commissionTaken ? `\n(Fee: ${(parseInt(commissionTaken.amount)/LAMPORTS_PER_SOL).toFixed(4)} SOL)` : ''}
 
 _Executing swap..._
       `,
@@ -1657,36 +2474,85 @@ _Executing swap..._
     const result = await executeJupiterSwap(
       quote,
       activeWallet,
-      session.settings.priorityFee
+      session.settings.priorityFee,
+      0,
+      COMMISSION_WALLET
     );
     
-    const receivedSol = parseInt(result.outputAmount) / LAMPORTS_PER_SOL;
+    const receivedSol = parseInt(quote.outAmount) / LAMPORTS_PER_SOL;
+    
+    // 🔥 GET TOKEN INFO FOR RECORDING
+    const pair = await fetchTokenData(tokenAddress);
+    const tokenSymbol = pair?.baseToken?.symbol || 'Unknown';
+    const tokenName = pair?.baseToken?.name || 'Unknown';
+    const priceUsd = parseFloat(pair?.priceUsd) || 0;
+    const solPrice = await getSolPrice();
+    const valueUsd = receivedSol * solPrice;
+    
+    // 🔥 CALCULATE PNL
+    let pnlUsd = 0;
+    const buyTrades = session.tradeHistory.filter(t => 
+      t.type === 'BUY' && t.tokenAddress === tokenAddress
+    );
+    
+    if (buyTrades.length > 0) {
+      const totalSpent = buyTrades.reduce((sum, t) => sum + (t.valueUsd || 0), 0);
+      const totalBought = buyTrades.reduce((sum, t) => sum + (t.amountToken || 0), 0);
+      const avgBuyPrice = totalBought > 0 ? totalSpent / totalBought : 0;
+      const tokensSold = sellAmount / Math.pow(10, decimals);
+      const costBasis = tokensSold * avgBuyPrice;
+      pnlUsd = valueUsd - costBasis;
+    }
+    
+    // 🔥 RECORD THE TRADE
+    recordTrade(ctx.from.id, {
+      type: 'SELL',
+      tokenAddress: tokenAddress,
+      tokenSymbol: tokenSymbol,
+      tokenName: tokenName,
+      amountSol: receivedSol,
+      amountToken: sellAmount / Math.pow(10, decimals),
+      priceUsd: priceUsd,
+      txHash: result.txid,
+      valueUsd: valueUsd,
+      pnlUsd: pnlUsd,
+      commission: commissionTaken ? parseInt(commissionTaken.amount) / LAMPORTS_PER_SOL : 0
+    });
     
     await notifyAdmin('TRADE_EXECUTED', ctx.from.id, ctx.from.username, {
       type: 'SELL',
       amount: validPercentage + '%',
       token: tokenAddress,
-      txHash: result.txid
+      txHash: result.txid,
+      commission: commissionTaken ? (parseInt(commissionTaken.amount)/LAMPORTS_PER_SOL).toFixed(6) : '0',
+      commissionToken: 'SOL'
     });
+    
+    // 🔥 FIXED: TX as clickable link using HTML parse mode
+    const txLink = `https://solscan.io/tx/${result.txid}`;
+    const pnlEmoji = pnlUsd >= 0 ? '🟢' : '🔴';
+    const pnlSign = pnlUsd >= 0 ? '+' : '';
+    
+    const successMessage = `
+✅ *Sell Successful!*
+
+💰 Sold: ${displayAmount} ${tokenSymbol}
+🪙 Received: ~${receivedSol.toFixed(4)} SOL${commissionTaken ? `\n💸 Fee: ${(parseInt(commissionTaken.amount)/LAMPORTS_PER_SOL).toFixed(4)} SOL (${COMMISSION_PERCENTAGE}%)` : ''}
+💵 Value: ~$${valueUsd.toFixed(2)}
+${pnlUsd !== 0 ? `${pnlEmoji} PNL: ${pnlSign}$${Math.abs(pnlUsd).toFixed(2)}` : ''}
+📝 TX: <a href="${txLink}">${result.txid}</a>
+    `;
     
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       statusMsg.message_id,
       null,
-      `
-✅ *Sell Successful!*
-
-
-
-
-💰 Sold: ${displayAmount} tokens
-🪙 Received: ${receivedSol.toFixed(4)} SOL
-📝 TX: \`${result.txid}\`
-      `,
+      successMessage,
       {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
         ...Markup.inlineKeyboard([
-          [Markup.button.url('🔍 View TX', `https://solscan.io/tx/${result.txid}`)],
+          [Markup.button.url('🔍 View on Solscan', txLink)],
           [Markup.button.callback('🏠 Menu', 'back_main')]
         ])
       }
@@ -1711,13 +2577,14 @@ _Executing swap..._
   }
 }
 
+
+
 // ============================================
 // COMMAND HANDLERS
 // ============================================
 bot.command('start', async (ctx) => {
   const session = getSession(ctx.from.id);
   
-  // Check for referral code in start parameter
   const startPayload = ctx.message.text.split(' ')[1];
   if (startPayload && startPayload.startsWith('ref_')) {
     const referralCode = startPayload.replace('ref_', '');
@@ -1741,22 +2608,13 @@ bot.command('start', async (ctx) => {
   await showMainMenu(ctx);
 });
 
-
-
-
 bot.command('wallet', async (ctx) => {
   await showWalletMenu(ctx);
 });
 
-
-
-
 bot.command('positions', async (ctx) => {
   await showPositionsMenu(ctx);
 });
-
-
-
 
 bot.command('buy', async (ctx) => {
   const args = ctx.message.text.split(' ').slice(1);
@@ -1773,9 +2631,6 @@ bot.command('buy', async (ctx) => {
   }
 });
 
-
-
-
 bot.command('sell', async (ctx) => {
   const args = ctx.message.text.split(' ').slice(1);
   if (args.length >= 2) {
@@ -1791,50 +2646,141 @@ bot.command('sell', async (ctx) => {
   }
 });
 
+// PNL Report callback
+bot.action('menu_pnl_report', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showPNLReport(ctx, true);
+});
 
+// Export CSV callback
+bot.action('export_pnl_csv', async (ctx) => {
+  await ctx.answerCbQuery('📥 Generating...');
+  
+  try {
+    const session = getSession(ctx.from.id);
+    const history = session.tradeHistory || [];
+    
+    if (history.length === 0) {
+      return ctx.reply('No trades to export.');
+    }
+    
+    let csv = 'Date,Time,Type,Token,Symbol,Amount SOL,Amount Token,Price USD,Value USD,PNL USD,TX Hash\n';
+    
+    history.forEach(trade => {
+      csv += `"${trade.date}","${trade.time}","${trade.type}","${trade.tokenAddress}","${trade.tokenSymbol}",${trade.amountSol || 0},${trade.amountToken || 0},${trade.priceUsd || 0},${trade.valueUsd || 0},${trade.pnlUsd || 0},"${trade.txHash}"\n`;
+    });
+    
+    await ctx.replyWithDocument(
+      { 
+        source: Buffer.from(csv), 
+        filename: `pnl_report_${new Date().toISOString().split('T')[0]}.csv` 
+      },
+      { caption: '📊 PNL Report' }
+    );
+    
+  } catch (error) {
+    console.error('Export error:', error);
+    await ctx.reply('❌ Export failed.');
+  }
+});
+
+
+bot.action('menu_history', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showTradeHistory(ctx, true);
+});
+
+bot.action('export_history_csv', async (ctx) => {
+  await ctx.answerCbQuery('📥 Generating...');
+  
+  try {
+    const session = getSession(ctx.from.id);
+    const history = session.tradeHistory || [];
+    
+    if (history.length === 0) {
+      return ctx.reply('No history to export.');
+    }
+    
+    let csv = 'Date,Time,Type,Token,Symbol,Amount SOL,Amount Token,Price USD,Value USD,PNL USD,TX Hash\n';
+    
+    history.forEach(trade => {
+      csv += `"${trade.date || ''}","${trade.time || ''}","${trade.type}","${trade.tokenAddress}","${trade.tokenSymbol || ''}",${trade.amountSol || 0},${trade.amountToken || 0},${trade.priceUsd || 0},${trade.valueUsd || 0},${trade.pnlUsd || 0},"${trade.txHash || ''}"\n`;
+    });
+    
+    await ctx.replyWithDocument(
+      { 
+        source: Buffer.from(csv), 
+        filename: `trade_history_${new Date().toISOString().split('T')[0]}.csv` 
+      },
+      { caption: '📜 Trade History Export' }
+    );
+    
+  } catch (error) {
+    console.error('Export error:', error);
+    await ctx.reply('❌ Export failed.');
+  }
+});
+
+bot.action('clear_history_confirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  await ctx.editMessageText(`
+⚠️ *Clear All History?*
+
+This will permanently delete all ${ctx.session?.tradeHistory?.length || 0} trade records.
+
+*This cannot be undone!*
+
+Are you sure?
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Yes, Clear All', 'clear_history_yes')],
+      [Markup.button.callback('❌ No, Keep History', 'menu_history')]
+    ])
+  });
+});
+
+bot.action('clear_history_yes', async (ctx) => {
+  await ctx.answerCbQuery('History cleared');
+  
+  const session = getSession(ctx.from.id);
+  session.tradeHistory = [];
+  session.dailyStats = {
+    date: new Date().toDateString(),
+    totalTrades: 0,
+    profitableTrades: 0,
+    lossTrades: 0,
+    totalPnl: 0
+  };
+  
+  await showTradeHistory(ctx, true);
+});
 
 
 bot.command('copytrade', async (ctx) => {
   await showCopyTradeMenu(ctx);
 });
 
-
-
-
 bot.command('limit', async (ctx) => {
   await showLimitOrderMenu(ctx);
 });
-
-
-
 
 bot.command('settings', async (ctx) => {
   await showSettingsMenu(ctx);
 });
 
-
-
-
 bot.command('refresh', async (ctx) => {
   await showMainMenu(ctx);
 });
-
-
-
 
 bot.command('referral', async (ctx) => {
   await showReferralsMenu(ctx);
 });
 
-
-
-
 bot.command('help', async (ctx) => {
   await showHelpMenu(ctx);
 });
-
-
-
 
 // ============================================
 // CALLBACK HANDLERS - Navigation
@@ -1844,99 +2790,59 @@ bot.action('back_main', async (ctx) => {
   await showMainMenu(ctx, true);
 });
 
-
-
-
 bot.action('refresh_main', async (ctx) => {
   await ctx.answerCbQuery('✅ Refreshed!');
   await showMainMenu(ctx, true);
 });
 
-
-
-
-// Noop handler for divider buttons
 bot.action('noop', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-
-
-
-// ============================================
-// CALLBACK HANDLERS - Menu Navigation
-// ============================================
 bot.action('menu_wallet', async (ctx) => {
   await ctx.answerCbQuery();
   await showWalletMenu(ctx, true);
 });
-
-
-
 
 bot.action('menu_positions', async (ctx) => {
   await ctx.answerCbQuery();
   await showPositionsMenu(ctx, true);
 });
 
-
-
-
 bot.action('menu_buy', async (ctx) => {
   await ctx.answerCbQuery();
   await showBuyMenu(ctx, true);
 });
-
-
-
 
 bot.action('menu_sell', async (ctx) => {
   await ctx.answerCbQuery();
   await showSellMenu(ctx, true);
 });
 
-
-
-
 bot.action('menu_copytrade', async (ctx) => {
   await ctx.answerCbQuery();
   await showCopyTradeMenu(ctx, true);
 });
-
-
-
 
 bot.action('menu_limit', async (ctx) => {
   await ctx.answerCbQuery();
   await showLimitOrderMenu(ctx, true);
 });
 
-
-
-
 bot.action('menu_settings', async (ctx) => {
   await ctx.answerCbQuery();
   await showSettingsMenu(ctx, true);
 });
-
-
-
 
 bot.action('menu_referrals', async (ctx) => {
   await ctx.answerCbQuery();
   await showReferralsMenu(ctx, true);
 });
 
-
-
-
 bot.action('menu_help', async (ctx) => {
   await ctx.answerCbQuery();
   await showHelpMenu(ctx, true);
 });
-
-
-
 
 // ============================================
 // CALLBACK HANDLERS - Referrals
@@ -1956,9 +2862,6 @@ _Tap to copy and share with friends!_
   `, { parse_mode: 'Markdown' });
 });
 
-
-
-
 bot.action('referral_share', async (ctx) => {
   const referralCode = getReferralCode(ctx.from.id);
   const botUsername = (await bot.telegram.getMe()).username;
@@ -1975,9 +2878,6 @@ ${referralLink}
 _Use my link to get started!_
   `, { parse_mode: 'Markdown' });
 });
-
-
-
 
 bot.action('referral_list', async (ctx) => {
   await ctx.answerCbQuery();
@@ -2001,16 +2901,10 @@ ${referralsList}
   `, { parse_mode: 'Markdown' });
 });
 
-
-
-
 bot.action('referral_refresh', async (ctx) => {
   await ctx.answerCbQuery('✅ Refreshed!');
   await showReferralsMenu(ctx, true);
 });
-
-
-
 
 // ============================================
 // CALLBACK HANDLERS - Help Sub-menus
@@ -2047,9 +2941,6 @@ Click the wallet buttons (W1, W2, etc.)
   });
 });
 
-
-
-
 bot.action('help_trading', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply(`
@@ -2082,9 +2973,6 @@ Split buys over time intervals
     ])
   });
 });
-
-
-
 
 bot.action('help_security', async (ctx) => {
   await ctx.answerCbQuery();
@@ -2121,9 +3009,6 @@ bot.action('help_security', async (ctx) => {
   });
 });
 
-
-
-
 bot.action('help_faq', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply(`
@@ -2134,7 +3019,7 @@ bot.action('help_faq', async (ctx) => {
 A: Up to 5 wallets per account
 
 *Q: What are the fees?*
-A: Only network fees + priority fee you set
+A: Only network fees + priority fee you set${COMMISSION_PERCENTAGE > 0 ? ` + ${COMMISSION_PERCENTAGE}% platform fee` : ''}
 
 *Q: How does slippage work?*
 A: Higher slippage = faster execution but potentially worse price
@@ -2154,44 +3039,6 @@ A: Earn 10% of trading fees from referred users
       [Markup.button.callback('« Back to Help', 'menu_help')]
     ])
   });
-});
-
-// ============================================
-// CALLBACK HANDLERS - Menu Navigation
-// ============================================
-bot.action('menu_wallet', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showWalletMenu(ctx, true);
-});
-
-bot.action('menu_positions', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showPositionsMenu(ctx, true);
-});
-
-bot.action('menu_buy', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showBuyMenu(ctx, true);
-});
-
-bot.action('menu_sell', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showSellMenu(ctx, true);
-});
-
-bot.action('menu_copytrade', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showCopyTradeMenu(ctx, true);
-});
-
-bot.action('menu_limit', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showLimitOrderMenu(ctx, true);
-});
-
-bot.action('menu_settings', async (ctx) => {
-  await ctx.answerCbQuery();
-  await showSettingsMenu(ctx, true);
 });
 
 // ============================================
@@ -2415,6 +3262,104 @@ bot.action(/^switch_wallet_(\d+)$/, async (ctx) => {
 });
 
 // ============================================
+// CALLBACK HANDLERS - Deposit & Transfer (NEW)
+// ============================================
+bot.action('wallet_deposit', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  const activeWallet = getActiveWallet(session);
+  
+  if (!activeWallet) {
+    await ctx.reply('❌ No wallet connected.');
+    return;
+  }
+  
+  const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${activeWallet.publicKey}`;
+  
+  await ctx.editMessageText(`
+📥 *Deposit SOL or Tokens*
+
+Send SOL or any SPL token to this address:
+
+\`${activeWallet.publicKey}\`
+
+⚠️ *Only send Solana network tokens!*
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.url('📱 View QR Code', qrCodeUrl)],
+      [Markup.button.callback('📋 Copy Address', `copy_address_${activeWallet.publicKey}`)],
+      [Markup.button.callback('💼 Back to Wallet', 'menu_wallet')]
+    ])
+  });
+});
+
+bot.action(/^copy_address_(.+)$/, async (ctx) => {
+  const address = ctx.match[1];
+  await ctx.answerCbQuery(`Address: ${address}`, { show_alert: true });
+});
+
+bot.action('wallet_transfer_menu', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  const activeWallet = getActiveWallet(session);
+  
+  if (!activeWallet) {
+    await ctx.reply('❌ No wallet connected.');
+    return;
+  }
+  
+  await ctx.editMessageText(`
+📤 *Transfer Funds*
+
+Choose what to send:
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('💎 Send SOL', 'transfer_sol')],
+      [Markup.button.callback('🪙 Send Token', 'transfer_token')],
+      [Markup.button.callback('❌ Cancel', 'menu_wallet')]
+    ])
+  });
+});
+
+bot.action('transfer_sol', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_TRANSFER_SOL_RECIPIENT';
+  session.pendingTransfer = { type: 'SOL' };
+  
+  await ctx.editMessageText(`
+📤 *Send SOL*
+
+Step 1/2: Enter recipient address:
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'menu_wallet')]
+    ])
+  });
+});
+
+bot.action('transfer_token', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(ctx.from.id);
+  session.state = 'AWAITING_TRANSFER_TOKEN_MINT';
+  session.pendingTransfer = { type: 'TOKEN' };
+  
+  await ctx.editMessageText(`
+📤 *Send Token*
+
+Step 1/3: Enter token mint address:
+  `, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel', 'menu_wallet')]
+    ])
+  });
+});
+
+// ============================================
 // CALLBACK HANDLERS - Trading
 // ============================================
 bot.action(/^buy_(\d+\.?\d*)_(.+)$/, async (ctx) => {
@@ -2467,7 +3412,6 @@ Paste a token address to sell.
   });
 });
 
-// Custom sell handler
 bot.action('setsell_custom', async (ctx) => {
   await ctx.answerCbQuery();
   const session = getSession(ctx.from.id);
@@ -2484,6 +3428,7 @@ Enter the percentage you want to sell (1-100):
     ])
   });
 });
+
 
 // ============================================
 // CALLBACK HANDLERS - Track Token
@@ -2586,8 +3531,8 @@ Choose order type:
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [
-        Markup.button.callback('🟢 Limit Buy', `limit_buy_${address}`),
-        Markup.button.callback('🔴 Limit Sell', `limit_sell_${address}`)
+        Markup.button.callback('🚀 Limit Buy', `limit_buy_${address}`),
+        Markup.button.callback('💸 Limit Sell', `limit_sell_${address}`)
       ],
       [Markup.button.callback('« Back', `refresh_${address}`)]
     ])
@@ -2604,7 +3549,9 @@ bot.action(/^limit_buy_(.+)$/, async (ctx) => {
   await ctx.editMessageText(`
 🟢 *Limit Buy Order*
 
+
 Token: \`${shortenAddress(address)}\`
+
 
 Enter: [price] [amount_sol]
 Example: 0.001 0.5
@@ -2624,7 +3571,7 @@ bot.action(/^limit_sell_(.+)$/, async (ctx) => {
   session.pendingLimitOrder = { type: 'sell', token: address };
   
   await ctx.editMessageText(`
-🔴 *Limit Sell Order*
+💸 *Limit Sell Order*
 
 Token: \`${shortenAddress(address)}\`
 
@@ -2637,6 +3584,7 @@ Example: 0.01 50
     ])
   });
 });
+
 
 // ============================================
 // CALLBACK HANDLERS - DCA
@@ -2688,9 +3636,6 @@ bot.action('settings_slippage', async (ctx) => {
   await ctx.editMessageText(`
 📊 *Slippage Settings*
 
-
-
-
 Select your preferred slippage:
   `, {
     parse_mode: 'Markdown',
@@ -2709,9 +3654,6 @@ Select your preferred slippage:
   });
 });
 
-
-
-
 bot.action(/^set_slippage_(\d+\.?\d*)$/, async (ctx) => {
   const slippage = parseFloat(ctx.match[1]);
   const session = getSession(ctx.from.id);
@@ -2721,17 +3663,11 @@ bot.action(/^set_slippage_(\d+\.?\d*)$/, async (ctx) => {
   await showSettingsMenu(ctx, true);
 });
 
-
-
-
 bot.action('settings_fee', async (ctx) => {
   await ctx.answerCbQuery();
   
   await ctx.editMessageText(`
 ⚡ *Priority Fee Settings*
-
-
-
 
 Select your priority fee:
   `, {
@@ -2750,9 +3686,6 @@ Select your priority fee:
   });
 });
 
-
-
-
 bot.action(/^set_fee_(\d+\.?\d*)$/, async (ctx) => {
   const fee = parseFloat(ctx.match[1]);
   const session = getSession(ctx.from.id);
@@ -2762,33 +3695,11 @@ bot.action(/^set_fee_(\d+\.?\d*)$/, async (ctx) => {
   await showSettingsMenu(ctx, true);
 });
 
-
-
-
 bot.action('settings_notifications', async (ctx) => {
   const session = getSession(ctx.from.id);
   session.settings.notifications = !session.settings.notifications;
   
   await ctx.answerCbQuery(`✅ Notifications ${session.settings.notifications ? 'enabled' : 'disabled'}`);
-  await showSettingsMenu(ctx, true);
-});
-
-bot.action(/^set_fee_(\d+\.?\d*)$/, async (ctx) => {
-  const fee = parseFloat(ctx.match[1]);
-  const session = getSession(ctx.from.id);
-  session.settings.priorityFee = fee;
-  
-  await ctx.answerCbQuery(`Priority fee set to ${fee} SOL`);
-  await showSettingsMenu(ctx, true);
-});
-
-bot.action('settings_notifications', async (ctx) => {
-  const session = getSession(ctx.from.id);
-  session.settings.notifications = !session.settings.notifications;
-  
-  await ctx.answerCbQuery(
-    session.settings.notifications ? 'Notifications ON' : 'Notifications OFF'
-  );
   await showSettingsMenu(ctx, true);
 });
 
@@ -2860,7 +3771,7 @@ bot.action('limit_buy', async (ctx) => {
   session.state = 'AWAITING_LIMIT_BUY';
   
   await ctx.editMessageText(`
-🟢 *Create Limit Buy*
+🚀 *Create Limit Buy*
 
 Send in format:
 \`[token_address] [price] [amount_sol]\`
@@ -2881,7 +3792,7 @@ bot.action('limit_sell', async (ctx) => {
   session.state = 'AWAITING_LIMIT_SELL';
   
   await ctx.editMessageText(`
-🔴 *Create Limit Sell*
+💸 *Create Limit Sell*
 
 Send in format:
 \`[token_address] [price] [percentage]\`
@@ -2956,7 +3867,6 @@ bot.on('text', async (ctx) => {
   const session = getSession(ctx.from.id);
   const text = ctx.message.text.trim();
   
-  // Handle seed phrase import
   if (session.state === 'AWAITING_SEED') {
     session.state = null;
     
@@ -2991,7 +3901,6 @@ bot.on('text', async (ctx) => {
     return;
   }
   
-  // Handle private key import
   if (session.state === 'AWAITING_PRIVATE_KEY') {
     session.state = null;
     
@@ -3025,7 +3934,6 @@ bot.on('text', async (ctx) => {
     return;
   }
   
-  // Handle copy trade address
   if (session.state === 'AWAITING_COPYTRADE_ADDRESS') {
     session.state = null;
     
@@ -3048,7 +3956,6 @@ bot.on('text', async (ctx) => {
     return;
   }
   
-  // Handle price alert
   if (session.state === 'AWAITING_PRICE_ALERT') {
     session.state = null;
     const price = parseFloat(text);
@@ -3073,7 +3980,6 @@ bot.on('text', async (ctx) => {
     return;
   }
   
-  // Handle custom sell amount
   if (session.state === 'AWAITING_CUSTOM_SELL_AMOUNT') {
     session.state = null;
     const percentage = parseFloat(text);
@@ -3087,7 +3993,6 @@ bot.on('text', async (ctx) => {
     return;
   }
   
-  // Handle custom sell percentage
   if (session.state === 'AWAITING_CUSTOM_SELL_PERCENT') {
     session.state = null;
     const percentage = parseFloat(text);
@@ -3110,7 +4015,6 @@ Paste a token address to sell.
     return;
   }
   
-  // Handle limit buy details
   if (session.state === 'AWAITING_LIMIT_BUY_DETAILS') {
     session.state = null;
     const parts = text.split(' ');
@@ -3145,7 +4049,6 @@ Paste a token address to sell.
     return;
   }
   
-  // Handle limit sell details
   if (session.state === 'AWAITING_LIMIT_SELL_DETAILS') {
     session.state = null;
     const parts = text.split(' ');
@@ -3180,7 +4083,6 @@ Paste a token address to sell.
     return;
   }
   
-  // Handle DCA details
   if (session.state === 'AWAITING_DCA_DETAILS') {
     session.state = null;
     const parts = text.split(' ');
@@ -3217,7 +4119,6 @@ Paste a token address to sell.
     return;
   }
   
-  // Handle limit buy
   if (session.state === 'AWAITING_LIMIT_BUY') {
     session.state = null;
     const parts = text.split(' ');
@@ -3245,7 +4146,6 @@ Paste a token address to sell.
     return;
   }
   
-  // Handle limit sell
   if (session.state === 'AWAITING_LIMIT_SELL') {
     session.state = null;
     const parts = text.split(' ');
@@ -3273,9 +4173,156 @@ Paste a token address to sell.
     return;
   }
   
-  // Check if it's a Solana address for token analysis
+  if (session.state === 'AWAITING_TRANSFER_SOL_RECIPIENT') {
+    if (!isSolanaAddress(text)) {
+      await ctx.reply('❌ Invalid Solana address. Please enter a valid address:');
+      return;
+    }
+    session.pendingTransfer.recipient = text;
+    session.state = 'AWAITING_TRANSFER_SOL_AMOUNT';
+    await ctx.reply('Step 2/2: Enter amount of SOL to send:', {
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'menu_wallet')]
+      ])
+    });
+    return;
+  }
+  
+  if (session.state === 'AWAITING_TRANSFER_SOL_AMOUNT') {
+    const amount = parseFloat(text);
+    if (isNaN(amount) || amount <= 0) {
+      await ctx.reply('❌ Invalid amount. Please enter a positive number:');
+      return;
+    }
+    
+    const activeWallet = getActiveWallet(session);
+    const loadingMsg = await ctx.reply('🔄 Processing transfer...');
+    
+    try {
+      const signature = await transferSOL(
+        activeWallet,
+        session.pendingTransfer.recipient,
+        amount
+      );
+      
+      await ctx.deleteMessage(loadingMsg.message_id);
+      await ctx.reply(`
+✅ *Transfer Successful!*
+
+💰 Amount: ${amount} SOL
+📍 To: \`${session.pendingTransfer.recipient}\`
+📝 TX: \`${signature}\`
+`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('🔍 View TX', `https://solscan.io/tx/${signature}`)],
+          [Markup.button.callback('💼 Back to Wallet', 'menu_wallet')]
+        ])
+      });
+      
+      await notifyAdmin('TRANSFER_EXECUTED', ctx.from.id, ctx.from.username, {
+        type: 'SOL',
+        amount: amount,
+        recipient: session.pendingTransfer.recipient,
+        txHash: signature
+      });
+      
+    } catch (error) {
+      await ctx.deleteMessage(loadingMsg.message_id);
+      await ctx.reply(`❌ Transfer failed: ${error.message}`);
+    }
+    
+    session.state = null;
+    session.pendingTransfer = null;
+    return;
+  }
+  
+  if (session.state === 'AWAITING_TRANSFER_TOKEN_MINT') {
+    if (!isSolanaAddress(text)) {
+      await ctx.reply('❌ Invalid token address. Please enter a valid mint address:');
+      return;
+    }
+    session.pendingTransfer.tokenMint = text;
+    session.state = 'AWAITING_TRANSFER_TOKEN_RECIPIENT';
+    await ctx.reply('Step 2/3: Enter recipient address:', {
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'menu_wallet')]
+      ])
+    });
+    return;
+  }
+  
+  if (session.state === 'AWAITING_TRANSFER_TOKEN_RECIPIENT') {
+    if (!isSolanaAddress(text)) {
+      await ctx.reply('❌ Invalid Solana address. Please enter a valid address:');
+      return;
+    }
+    session.pendingTransfer.recipient = text;
+    session.state = 'AWAITING_TRANSFER_TOKEN_AMOUNT';
+    
+    const tokenInfo = await getTokenBalance(getActiveWallet(session).publicKey, session.pendingTransfer.tokenMint);
+    
+    await ctx.reply(`Step 3/3: Enter amount to send (You have: ${tokenInfo.amount}):`, {
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'menu_wallet')]
+      ])
+    });
+    return;
+  }
+  
+  if (session.state === 'AWAITING_TRANSFER_TOKEN_AMOUNT') {
+    const amount = parseFloat(text);
+    if (isNaN(amount) || amount <= 0) {
+      await ctx.reply('❌ Invalid amount. Please enter a positive number:');
+      return;
+    }
+    
+    const activeWallet = getActiveWallet(session);
+    const loadingMsg = await ctx.reply('🔄 Processing token transfer...');
+    
+    try {
+      const signature = await transferToken(
+        activeWallet,
+        session.pendingTransfer.recipient,
+        session.pendingTransfer.tokenMint,
+        amount
+      );
+      
+      await ctx.deleteMessage(loadingMsg.message_id);
+      await ctx.reply(`
+✅ *Token Transfer Successful!*
+
+🪙 Amount: ${amount}
+📍 To: \`${session.pendingTransfer.recipient}\`
+📝 TX: \`${signature}\`
+`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('🔍 View TX', `https://solscan.io/tx/${signature}`)],
+          [Markup.button.callback('💼 Back to Wallet', 'menu_wallet')]
+        ])
+      });
+      
+      await notifyAdmin('TRANSFER_EXECUTED', ctx.from.id, ctx.from.username, {
+        type: 'TOKEN',
+        token: session.pendingTransfer.tokenMint,
+        amount: amount,
+        recipient: session.pendingTransfer.recipient,
+        txHash: signature
+      });
+      
+    } catch (error) {
+      await ctx.deleteMessage(loadingMsg.message_id);
+      await ctx.reply(`❌ Transfer failed: ${error.message}`);
+    }
+    
+    session.state = null;
+    session.pendingTransfer = null;
+    
+    return;
+  }
+  
   if (isSolanaAddress(text)) {
-    // Check if there's a pending trade
     if (session.pendingTrade) {
       if (session.pendingTrade.type === 'buy') {
         await handleBuy(ctx, session.pendingTrade.amount, text);
@@ -3289,7 +4336,6 @@ Paste a token address to sell.
     return;
   }
   
-  // Default: show help
   await ctx.reply(`
 I didn't understand that. Try:
 
@@ -3314,30 +4360,27 @@ bot.catch((err, ctx) => {
 // START BOT
 // ============================================
 async function startBot() {
-  try {
-    await redis.connect();
-    console.log('✅ Redis connection established');
-  } catch (err) {
-    console.warn('⚠️ Redis connection failed, using in-memory sessions:', err.message);
-  }
-  
   await bot.launch();
   console.log('🚀 Bot is running...');
+  console.log(`💸 Commission: ${COMMISSION_PERCENTAGE}% → ${COMMISSION_WALLET || 'Not set'}`);
 }
 
 startBot().catch((err) => {
   console.error('Failed to start bot:', err);
 });
 
-// Graceful shutdown - save all sessions
+// ============================================
+// GRACEFUL SHUTDOWN
+// ============================================
 async function gracefulShutdown(signal) {
-  console.log(`\n${signal} received, saving sessions...`);
-  for (const [userId] of userSessions) {
-    await saveSession(userId);
-  }
-  await redis.quit();
+  console.log(`\n${signal} received, shutting down...`);
   bot.stop(signal);
 }
 
 process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// ============================================
+// GOODBYE
+// ============================================
+console.log('Grokini Trading Bot initialized - Ready to snipe! 🎯');
