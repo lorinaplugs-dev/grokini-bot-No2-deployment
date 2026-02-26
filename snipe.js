@@ -1409,7 +1409,7 @@ async function showMainMenu(ctx, edit = false) {
     }
     
     const message = `
-🚀 *Welcome to Grokini Trading Bot* 🤖
+🚀 *Welcome to BeeKeeper Trading Bot* 🤖
 
 *I'm your Web3 execution engine*.
 AI-driven. Battle-tested. Locked down.
