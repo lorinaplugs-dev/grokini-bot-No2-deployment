@@ -1710,8 +1710,8 @@ _Tap a wallet to switch, or manage below:_
       
       if (session.wallets.length < MAX_WALLETS) {
         keyboardButtons.push([
-          Markup.button.callback('🆕 Create New', 'wallet_create'),
-          Markup.button.callback('📥 Import', 'wallet_import_menu')
+      
+        Markup.button.callback('📥 Import', 'wallet_import_menu')
         ]);
       }
       
@@ -1729,7 +1729,7 @@ Create a new wallet or import an existing one:
     `;
       
       keyboardButtons = [
-        [Markup.button.callback('🆕 Create New Wallet', 'wallet_create')],
+       
         [Markup.button.callback('📥 Import Seed Phrase', 'wallet_import_seed')],
         [Markup.button.callback('🔑 Import Private Key', 'wallet_import_key')],
         [Markup.button.callback('« Back', 'back_main')]
