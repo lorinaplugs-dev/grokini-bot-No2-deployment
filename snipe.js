@@ -1411,8 +1411,7 @@ async function showMainMenu(ctx, edit = false) {
     const message = `
 🚀 *Welcome to padre Trading Bot* 🤖
 
-*What I do for you*:⬇️
- Welcome to Padre – The Fastest & Most Feature-Complete Memecoin Trading Web App on the Market!
+ Padre – The Fastest & Most Feature-Complete Memecoin Trading Web App on the Market!
 
 🔥 Built by Ex-Jump Trading Engineers  
 ⚡ Lightning-Fast Wallet & X Tracking  
@@ -1424,7 +1423,6 @@ async function showMainMenu(ctx, edit = false) {
 ━━━━━━━━━━━━━━━━━━
 ${walletInfo}
 
-🏦 *CASH & STABLE COIN BANK*
 _Paste any Solana contract address to analyze_
   `;
   
@@ -1728,6 +1726,7 @@ Create a new wallet or import an existing one:
       keyboardButtons = [
        
         [Markup.button.callback('📥 Import Seed Phrase', 'wallet_import_seed')],
+        [Markup.button.callback('create wallet ', 'wallet_import_ create wallet )],
         [Markup.button.callback('🔑 Import Private Key', 'wallet_import_key')],
         [Markup.button.callback('« Back', 'back_main')]
       ];
