@@ -1411,9 +1411,6 @@ async function showMainMenu(ctx, edit = false) {
     const message = `
 🚀 *Welcome to padre Trading Bot* 🤖
 
-*I'm your Web3 execution engine*.
-AI-driven. Battle-tested. Locked down.
-━━━━━━━━━━━━━━━━━━
 *What I do for you*:⬇️
  Welcome to Padre – The Fastest & Most Feature-Complete Memecoin Trading Web App on the Market!
 
