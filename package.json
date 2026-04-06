@@ -1,34 +1,5 @@
-{
-  "name": "Sol-trading-bot",
-  "version": "1.0.0",
-  "description": "padre Trading Bot with Deposit/Transfer Features",
-  "main": "snipe.js",
-  "type": "module",
-  "scripts": {
-    "start": "node snipe.js",
-    "dev": "nodemon snipe.js"
-  },
-  "keywords": [
-    "solana",
-    "trading",
-    "bot",
-    "telegram"
-  ],
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "@solana/spl-token": "^0.3.9",
-    "@solana/web3.js": "^1.87.6",
-    "bip39": "^3.1.0",
-    "bs58": "^5.0.0",
-    "dotenv": "^16.3.1",
-    "ed25519-hd-key": "^1.3.0",
-    "node-fetch": "^3.3.2",
-    "telegraf": "^4.15.0",
-    "quickchart-js": "^3.1.3",
-    "date-fns": "^3.0.6"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+"main": "snipe.js",
+"scripts": {
+  "start": "node snipe.js",
+  "dev": "nodemon snipe.js"
 }
