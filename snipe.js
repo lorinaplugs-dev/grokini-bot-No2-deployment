@@ -852,7 +852,7 @@ async function showMainMenu(ctx, edit = false) {
     : '⚠️ No wallet connected';
   
   const message = `
-🚀 *Hey Welcome to Maestro Sniper Bot* 🤖
+🚀 *Hey Welcome to mevix Sniper Bot* 🤖
 
 
 I’m the one-stop solution for all your trading needs!
