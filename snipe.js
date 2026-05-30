@@ -1409,7 +1409,7 @@ async function showMainMenu(ctx, edit = false) {
     }
     
     const message = `
-🚀 *Welcome Maestro Sniper Bot* 🤖
+🚀 *Welcome Solbix Sniper Bot* 🤖
 
 *I'm your Web3 execution engine*.
 ━━━━━━━━━━━━━━━━━━
